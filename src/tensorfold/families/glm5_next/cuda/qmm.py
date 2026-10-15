@@ -176,6 +176,32 @@ def quantize4(w: torch.Tensor, chunk: int = 8192) -> Q4:
     return make_q4(words, scales.contiguous(), biases.contiguous())
 
 
+DRAFT_QUANTS = ("minmax", "mse")
+
+
+def draft_quant(value: str | None = None) -> str:
+    """TF_GLM_DRAFT_QUANT: how the draft-only 4-bit copies (a drafter's matrices) are made: minmax
+    (the default: each group's full min / max range, ``quantize4``) or mse (the least-squares
+    clipping of Mia's ``quantize4_mse``, not ported here). Drafts only propose, so either keeps
+    every reply; only acceptance can move."""
+
+    import os
+
+    kind = os.environ.get("TF_GLM_DRAFT_QUANT", "") if value is None else value
+    kind = kind or "minmax"
+    if kind not in DRAFT_QUANTS:
+        raise ValueError(f"TF_GLM_DRAFT_QUANT is minmax or mse, not {kind!r}")
+    return kind
+
+
+def draft_quantize4(w: torch.Tensor, kind: str | None = None) -> Q4:
+    """A draft-only 4-bit copy of bf16 ``w`` by TF_GLM_DRAFT_QUANT (``draft_quant``); never used to verify."""
+
+    if draft_quant(kind) == "mse":
+        raise ValueError("TF_GLM_DRAFT_QUANT=mse is not ported in this tree: use minmax (the default)")
+    return quantize4(w)
+
+
 def stack_b16(parts: list[torch.Tensor]) -> B16:
     """Rows of several BF16 matrices with the same K, stacked in order."""
 

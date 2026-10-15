@@ -23,6 +23,32 @@ NOISE = 0.7       # the target's keyed noise weight when sampling
 NO_LIMIT = 1e30
 
 
+def best_depth(q, round_ms) -> int:
+    """The k (0..len(q)) maximizing E[tokens | k drafts] / round_ms[k], q the drafts' conditional
+    acceptances; round_ms[k] the ms of a round of k drafts (k = 0..len(q)). DSpark's confidence
+    chain cuts here (``round_ms`` from the engine's calibration)."""
+
+    alive = np.concatenate([[1.0], np.cumprod(np.asarray(q, dtype=np.float64))])
+    expect = np.cumsum(alive)
+    ms = np.asarray(round_ms[:len(q) + 1], dtype=np.float64)
+    return int(np.argmax(expect / ms))
+
+
+def merge_candidates(g: torch.Tensor, proj: torch.Tensor, k: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """A block pass's host rows -> (ids [depth, k], logits, projected rows): ``g`` [ranks, depth, 2 * k]
+    (each rank's top-k values, then ids as fp32 bits), merged by value then id over the ranks;
+    ``proj`` [depth, selector rank] fp32."""
+
+    values = torch.cat([g[r, :, :k] for r in range(g.shape[0])], dim=1).numpy().astype(np.float64)
+    tokens = torch.cat([g[r, :, k:].contiguous().view(torch.int32) for r in range(g.shape[0])],
+                       dim=1).numpy().astype(np.int64)
+    if g.shape[0] > 1:
+        order = np.lexsort((tokens, -values), axis=-1)[:, :k]
+        values = np.take_along_axis(values, order, axis=1)
+        tokens = np.take_along_axis(tokens, order, axis=1)
+    return tokens, values, proj.numpy().astype(np.float64)          # astype copies: nothing keeps the host buffer
+
+
 @triton.jit
 def _dconv_kernel(X, DYN, BASE, RES, OUT, D: tl.constexpr, G: tl.constexpr, GS: tl.constexpr,
                   BRANCH: tl.constexpr, HAS_RES: tl.constexpr, BLOCK: tl.constexpr):
@@ -174,8 +200,10 @@ class Drafter:
     """Draft one sequence from position-indexed context using device lengths and static buffers shared by eager execution and CUDA graphs."""
 
     def __init__(self, draft_dir: str | Path, w: Weights, *, block: int | None = None, capacity: int = 2560,
-                 ring: bool = False) -> None:
-        """``ring`` (TF_GLM_DRAFT_RING): the context in a ring of the window and block, the same drafts."""
+                 tap_rows: int = 0, ring: bool = False) -> None:
+        """``ring`` (TF_GLM_DRAFT_RING): the context in a ring of the window and block, the same drafts.
+        ``tap_rows``: context updates up to this many rows (a verify window's kept rows) replay captured
+        graphs too (the block's own size always does); 0: the block's size, as before."""
 
         path = Path(draft_dir)
         cfg = json.loads((path / "config.json").read_text())
@@ -272,6 +300,7 @@ class Drafter:
         self.pool = None
         self.block_graph = None
         self.tap_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self.tap_rows = min(max(self.block, int(tap_rows)), self.tap_in.shape[0])
 
     def nbytes(self) -> int:
         total = sum(q.nbytes() for L in self.layers for q in (L.a_kp, L.m_kp, L.qkv, L.kv, L.o, L.gu, L.down))
@@ -399,13 +428,13 @@ class Drafter:
 
     @torch.no_grad()
     def capture(self) -> None:
-        """CUDA graphs for the block pass and for context updates of 1..block rows (both ranks together)."""
+        """CUDA graphs for the block pass and for context updates of 1..tap_rows rows (both ranks together)."""
 
         self.pool = torch.cuda.graph_pool_handle()
         self.reset()
         self.tap_in.zero_()
         self.ids[0] = 0
-        for n in range(1, self.block + 1):
+        for n in range(1, self.tap_rows + 1):
             for _ in range(2):
                 self._taps_compute(n)
             torch.cuda.synchronize()
@@ -435,15 +464,7 @@ class Drafter:
         else:
             self._block_compute()
         g = self.packed[:, :depth].cpu()
-        k = self.top_k
-        values = torch.cat([g[r, :, :k] for r in range(g.shape[0])], dim=1).numpy().astype(np.float64)
-        tokens = torch.cat([g[r, :, k:].contiguous().view(torch.int32) for r in range(g.shape[0])],
-                           dim=1).numpy().astype(np.int64)
-        if g.shape[0] > 1:
-            order = np.lexsort((tokens, -values), axis=-1)[:, :k]
-            values = np.take_along_axis(values, order, axis=1)
-            tokens = np.take_along_axis(tokens, order, axis=1)
-        return tokens, values, self.proj[:depth].cpu().numpy().astype(np.float64)
+        return merge_candidates(g, self.proj[:depth].cpu(), self.top_k)
 
     def chain(self, tokens: np.ndarray, values: np.ndarray, proj: np.ndarray, anchor: int, first: int,
               sampling: Sampling | None, confidence: float = 0.0) -> list[int]:
