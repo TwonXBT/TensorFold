@@ -23,7 +23,7 @@ def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_rdma_gather_v6", sources=[str(here / "rdma_gather.cu")],
+    return load(name="tensorfold_rdma_gather_v7", sources=[str(here / "rdma_gather.cu")],
                 extra_cuda_cflags=["-O3"], extra_ldflags=["-libverbs"], verbose=False)
 
 
@@ -61,9 +61,11 @@ class RdmaGather:
         cpu = int(os.environ.get("TF_RDMA_CPU", "-1"))
         self.ext, self.rank, self.world, self.max_bytes = ext, rank, world, int(max_bytes)
         self.devices = device_names() if devices is None else list(devices)
+        self.gid_indexes = []
         error = ""
         try:
             self.h = ext.create(rank, world, self.max_bytes, slots, self.devices, gid, cpu)
+            self.gid_indexes = [int(i) for i in ext.gid_indexes(self.h)]
             info = pickle.dumps(ext.local_info(self.h))
         except Exception as exc:           # noqa: BLE001  (published, so every rank refuses together)
             error, info = f"{type(exc).__name__}: {exc}", b""

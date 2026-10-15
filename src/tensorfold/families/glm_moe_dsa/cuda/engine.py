@@ -347,7 +347,8 @@ def _rdma(comm, rank: int, world: int, max_bytes: int):
         print(f"[tensorfold] decode all-gathers stay on NCCL: {exc}", flush=True)
         return comm
     if rank == 0:
-        print(f"[tensorfold] decode all-gathers: RDMA writes over {', '.join(rdma.devices)}", flush=True)
+        names = [f"{d}(gid{i})" for d, i in zip(rdma.devices, rdma.gid_indexes)] or rdma.devices
+        print(f"[tensorfold] decode all-gathers: RDMA writes over {', '.join(names)}", flush=True)
     return Hybrid(comm, rdma)
 
 
