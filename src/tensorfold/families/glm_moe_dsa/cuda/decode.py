@@ -189,14 +189,23 @@ def serial_decode(e: "Engine", pending: int, count: int, sampling, *, stop_eos: 
     return DecodeResult(out, time.perf_counter() - start, len(out) - 1, stages=stages)
 
 
+def copy_room(copies, count: int, out: list[int]) -> int:
+    """Copy drafts a round may propose: the rows still wanted past the pending token (0 without copy drafts)."""
+
+    return 0 if copies is None else count - len(out) - 1
+
+
 @torch.no_grad()
 def mtp_decode(e: "Engine", pending: int, count: int, sampling, *, policy: DepthPolicy | None = None,
-               stop_eos: bool = False, on_tokens=None) -> DecodeResult:
+               stop_eos: bool = False, on_tokens=None, copies=None) -> DecodeResult:
     """Flash's verify loop (pending + MTP drafts, kept through the first mismatch) over this family's commit.
 
     Flash's own ``mtp_decode`` commits through its KDA state (``st.cur`` ping-pong); GLM-5.3 has none, so the loop is
     restated here verbatim with this family's ``commit`` (advance the position; latent rows past ``keep`` are simply
-    overwritten by the next window).
+    overwritten by the next window). ``copies``: a ``copy_drafts.CopyDrafts`` of the prompt and reply so far; a round
+    it proposes for drafts the copied tokens instead of the MTP chain (the MTP head still absorbs the kept rows, so
+    its cache stays current), and the depth policy is fed (0, 0) after it, so copy rounds never move the MTP depth.
+    Drafts only propose: the reply is the serial sample either way.
     """
 
     import time
@@ -208,13 +217,19 @@ def mtp_decode(e: "Engine", pending: int, count: int, sampling, *, policy: Depth
     out = [pending]
     stages = dict(draft=0.0, forward=0.0, sample=0.0, commit=0.0)
     rounds = drafted = accepted = 0
+    c_rounds = c_drafted = c_accepted = 0
     depths: list[int] = []
     keeps: list[int] = []
     torch.cuda.synchronize()
     start = time.perf_counter()
     t0 = time.perf_counter()
-    depth = min(policy.next(0, 0), count - len(out))
-    drafts = draft(e, e.last_hidden, [pending], st.pos + 1, depth, sampling, policy.confidence) if depth > 0 else []
+    copied = copies.propose(copy_room(copies, count, out)) if copies is not None else []
+    if copied:                              # a copy round: the MTP head absorbs the pending token, drafts nothing
+        absorb(e, e.last_hidden, [pending])
+        drafts = copied
+    else:
+        depth = min(policy.next(0, 0), count - len(out))
+        drafts = draft(e, e.last_hidden, [pending], st.pos + 1, depth, sampling, policy.confidence) if depth > 0 else []
     stages["draft"] += time.perf_counter() - t0
     while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
         t0 = time.perf_counter()
@@ -236,10 +251,14 @@ def mtp_decode(e: "Engine", pending: int, count: int, sampling, *, policy: Depth
         rounds += 1
         drafted += len(drafts)
         accepted += keep - 1
+        if copied:
+            c_rounds, c_drafted, c_accepted = c_rounds + 1, c_drafted + len(drafts), c_accepted + keep - 1
         depths.append(len(drafts))
         keeps.append(keep)
         e.follow(sampled[:keep])
         out.extend(sampled[:keep])
+        if copies is not None:
+            copies.extend(sampled[:keep])
         if on_tokens is not None:
             on_tokens(sampled[:keep][:max(0, count - (len(out) - keep))])
         stages["forward"] += t1 - t0
@@ -248,12 +267,20 @@ def mtp_decode(e: "Engine", pending: int, count: int, sampling, *, policy: Depth
         if len(out) >= count or (stop_eos and out[-1] in w.cfg.eos):
             break
         t4 = time.perf_counter()
-        depth = min(policy.next(len(drafts), keep - 1), count - len(out))
-        drafts = (draft(e, e.main_hidden(slice(0, keep)), sampled[:keep], st.pos + 1, depth, sampling,
-                        policy.confidence) if depth > 0 else [])
+        was_copy = bool(copied)
+        copied = copies.propose(copy_room(copies, count, out)) if copies is not None else []
+        if copied:                          # the MTP head still takes the kept rows; it drafts nothing this round
+            absorb(e, e.main_hidden(slice(0, keep)), sampled[:keep])
+            drafts = copied
+        else:                               # a copied round's acceptance does not move the MTP depth
+            depth = min(policy.next(*((0, 0) if was_copy else (len(drafts), keep - 1))), count - len(out))
+            drafts = (draft(e, e.main_hidden(slice(0, keep)), sampled[:keep], st.pos + 1, depth, sampling,
+                            policy.confidence) if depth > 0 else [])
         stages["draft"] += time.perf_counter() - t4
     torch.cuda.synchronize()
-    return DecodeResult(out[:count], time.perf_counter() - start, rounds, drafted, accepted, stages, depths, keeps)
+    res = DecodeResult(out[:count], time.perf_counter() - start, rounds, drafted, accepted, stages, depths, keeps)
+    res.copy_rounds, res.copy_drafted, res.copy_accepted = c_rounds, c_drafted, c_accepted
+    return res
 
 
 class Engine:
