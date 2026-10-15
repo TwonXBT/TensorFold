@@ -251,9 +251,9 @@ class Buffers(FlashBuffers):
         self.ik = torch.empty((rows, c.index_dim), dtype=bf, device=dev)          # the window's indexer keys
         self.qp = torch.empty((rows, share(c.heads, w.world, w.rank), c.qk_rope), dtype=bf, device=dev)  # rope slices
         self.iw = torch.empty((rows, c.index_heads), dtype=bf, device=dev)        # indexer head weights per token
-        # no hyper-connections: x holds one stream
+        # no hyper-connections: x holds one stream; the inherited taps stay (empty until set_taps: a
+        # DSpark drafter's tap points), filled by compute / prompt_layers as a plain copy of x
         self.x = torch.empty((rows, c.hidden), dtype=bf, device=dev)
-        del self.taps, self.tap_at
         # kv_a's output is the latent then the shared rope key (kv_lora + qk_rope): Flash's buffer has no rope part
         self.lat = torch.empty((rows, c.kv_lora + c.qk_rope), dtype=bf, device=dev)
         # EXL3 groups (attention, MLPs, MTP, head) share one scratch; the routed experts run on the universal kernel
@@ -694,6 +694,16 @@ def ffn_part(layer: LayerW, w: Weights, b: Buffers, R: int, pre=None):
         return mlp_block(layer, w, b, R) if layer.mlp is not None else moe_block(layer, w, b, R)
 
 
+def fill_taps(b: Buffers, layer: LayerW, R: int, *, key: int | None = None) -> None:
+    """The residual stream into the tap buffers (a DSpark drafter's tap points; a plain copy: one
+    stream, not Flash's stream_mean). ``key``: the layer the stream is "after" when that differs
+    from ``layer.index`` — prompt_layers' deferred residual means x holds the input of ``layer``
+    (the stream after index - 1) once its attention halves have run. A no-op without taps."""
+
+    for slot in b.tap_at.get(layer.index if key is None else key, ()):
+        b.taps[slot][:R].copy_(b.x[:R])
+
+
 def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch: int | None = None,
                   host_pos: int | None = None, sparse_np: int | None = None) -> None:
     residual(b.x[:R], b.x[:R], attn_part(layer, w, st, b, R, nch, host_pos, sparse_np))
@@ -714,10 +724,15 @@ def prompt_layers(w: Weights, st: State, b: Buffers, R: int, nch: int | None, ho
     for layer in w.layers:
         for i, (v, r, pos, hp) in enumerate(mbs):
             pend[i] = attn_part(layer, w, st, v, r, nch, hp, sparse_np, pos, pre=pend[i])
+        # the deferred residual: x now holds this layer's input, i.e. the stream after layer
+        # index - 1 — the tap points. The decode path (compute) fills the same rows the direct
+        # way, after layer_forward; both read x once the layer's residual is complete.
+        fill_taps(b, layer, R, key=layer.index - 1)
         for i, (v, r, pos, hp) in enumerate(mbs):
             pend[i] = ffn_part(layer, w, v, r, pre=pend[i])
     for i, (v, r, pos, hp) in enumerate(mbs):
         residual(v.x[:r], v.x[:r], pend[i])
+    fill_taps(b, w.layers[-1], R)   # a tap after the final layer: only now does that stream exist
 
 
 def check_room(w: Weights, st: State, R: int, pos: int | None = None) -> None:
@@ -777,6 +792,7 @@ def compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, n
     else:
         for layer in w.layers:
             layer_forward(layer, w, st, b, R, nch, host_pos, sparse_np)
+            fill_taps(b, layer, R)
     if not logits:
         return None
     glue.rmsnorm(b.x[:R], w.norm, c.eps, b.fnormed[:R], b.fxs[:R])
