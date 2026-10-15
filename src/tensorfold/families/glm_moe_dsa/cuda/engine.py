@@ -156,8 +156,10 @@ class GlmEngine:
                 print(f"[tensorfold] up to {streams} requests decode together, each with a {self.limit}-token window "
                       f"({pool}); {depth} MTP drafts a round", flush=True)
         else:
+            # taps=(): no drafter yet; a DSpark drafter (later steps) passes its tap_layers, and the
+            # geometry below then counts the tap buffers (decode rows + the prompt chunks' rows)
             self.e = Decoder(w, capacity=capacity, max_rows=MAX_ROWS, prefill_rows=prefill_rows, graphs=True,
-                             graph_rows=GRAPH_ROWS, long_context=long_context)
+                             graph_rows=GRAPH_ROWS, long_context=long_context, taps=())
         self.eos = tuple(w.cfg.eos)
         self.model_dir = Path(model_dir)
         self.request = threading.local()    # the calling request's policy and stop-at-EOS (``app.GlmApp``)
@@ -166,7 +168,7 @@ class GlmEngine:
 
     @staticmethod
     def _geometry(text: dict, world: int, kv: str | None = None, dcp: int = 1, rows: int | None = None,
-                  streams: int = 1):
+                  streams: int = 1, taps: int = 0):
         """The Flash MLA geometry minus the KDA and hyper-connection terms, with the MTP head counted, and this family's
         own cache a slot: Flash counts a 512-wide latent and three indexer planes a layer, this family keeps the latent
         plus a 64-wide rope key a layer (and the MTP head's) and one indexer key plane a full-indexer layer (96,640 B a
@@ -207,6 +209,8 @@ class GlmEngine:
             extra = r * hl * ((lw + pw) * 2 * (1 + dcp) + (lw // 2 + 1) * 4 * 2 * dcp) + (24 << 20)
             extra += 2 * r * dcp * 2048 * 8            # a prompt block's gathered selection candidates
         extra += max(0, prompt_rows - PREFILL_ROWS) * PROMPT_ROW_BYTES      # chunks wider than geometry's 2,048 rows
+        if taps:                     # a drafter's tap buffers: the decode window's and the prompt chunks' rows
+            extra += taps * (MAX_ROWS + prompt_rows) * int(text["hidden_size"]) * 2
         qs_row = 2 * int(text["kv_lora_rank"])
         if streams > 1:
             from .multi import EXTENTS, FILL_ROW_BYTES, FILL_ROWS

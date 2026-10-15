@@ -304,6 +304,9 @@ class Engine:
         self.rows, self.prefill_rows = max_rows, prefill_rows or PREFILL_ROWS
         self.buf = fwd.Buffers(w, max_rows, capacity)
         self.pbuf = fwd.Buffers(w, self.prefill_rows, capacity, prefill=True)
+        if taps:                     # a drafter's tap points: before any graph capture (the fill is captured)
+            self.buf.set_taps(tuple(taps), w.cfg.hidden)
+            self.pbuf.set_taps(tuple(taps), w.cfg.hidden)
         self.mbuf = fwd.Buffers(w, max_rows, capacity) if w.mtp is not None else None
         self.st = fwd.State(w, capacity, max_rows)
         self.last_hidden: torch.Tensor | None = None
@@ -365,7 +368,12 @@ class Engine:
             self.constraint.advance(tokens)
 
     def tap_rows(self, n: int, b=None) -> torch.Tensor:
-        raise ValueError("GLM-5.3 has no hyper-connection taps: a DFlash2 drafter cannot attach")
+        """The last forward's first n rows of the tap buffers, concatenated in layer order: [n, taps * D]."""
+
+        taps = (b or self.buf).taps
+        if not taps:
+            raise ValueError("no tap points were set: a drafter cannot attach (Engine(taps=...))")
+        return torch.cat([t[:n] for t in taps], dim=1)
 
     def main_hidden(self, rows: slice) -> torch.Tensor:
         """The final-normed main-model rows that the MTP head reads after a forward with logits."""
