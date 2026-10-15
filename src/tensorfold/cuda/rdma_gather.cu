@@ -62,6 +62,7 @@ struct Nic {
     ibv_cq* cq = nullptr;
     ibv_mr* mr = nullptr;
     ibv_gid gid{};
+    int gid_index = -1;                   // the index gid was read at (g.gid_index < 0: picked per device in open_nic)
     std::vector<ibv_qp*> qps;             // per peer
     std::vector<uint32_t> psns;
 };
@@ -497,6 +498,30 @@ void proxy_loop(Gather* gp) {
     }
 }
 
+// The type sysfs shows for a GID index ("" when unreadable): "RoCE v2", "IB/RoCE v1", ...
+std::string gid_type(const std::string& device, int port, int index) {
+    char path[256];
+    snprintf(path, sizeof(path), "/sys/class/infiniband/%s/ports/%d/gid_attrs/types/%d", device.c_str(), port, index);
+    FILE* f = fopen(path, "r");
+    if (!f) return "";
+    char buf[32] = {0};
+    const bool got = fgets(buf, sizeof(buf), f) != nullptr;
+    fclose(f);
+    if (!got) return "";
+    std::string type(buf);
+    while (!type.empty() && (type.back() == '\n' || type.back() == '\r' || type.back() == ' ')) type.pop_back();
+    return type;
+}
+
+// An IPv4-mapped GID (::ffff:a.b.c.d): bytes 0-9 zero, 10-11 0xff, 12-15 the address (not all zero)
+bool ipv4_mapped(const ibv_gid& gid) {
+    const unsigned char* r = gid.raw;
+    for (int i = 0; i < 10; ++i)
+        if (r[i]) return false;
+    if (r[10] != 0xff || r[11] != 0xff) return false;
+    return r[12] || r[13] || r[14] || r[15];
+}
+
 Nic open_nic(const std::string& name, Gather& g, int world, int rank) {
     int count = 0;
     ibv_device** list = ibv_get_device_list(&count);
@@ -515,7 +540,22 @@ Nic open_nic(const std::string& name, Gather& g, int world, int rank) {
     TORCH_CHECK(nic.cq, "rdma gather: ibv_create_cq failed");
     nic.mr = ibv_reg_mr(nic.pd, g.host, g.host_bytes, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
     TORCH_CHECK(nic.mr, "rdma gather: ibv_reg_mr of ", g.host_bytes, " pinned bytes on ", name, " failed");
-    TORCH_CHECK(ibv_query_gid(nic.ctx, g.port, g.gid_index, &nic.gid) == 0, "rdma gather: ibv_query_gid failed");
+    // g.gid_index >= 0: every device uses it (unchanged behaviour); < 0: each device picks its own lowest RoCE v2
+    // index with an IPv4-mapped GID (the two rails' indexes differ when stale addresses shift a table)
+    nic.gid_index = g.gid_index;
+    if (nic.gid_index < 0) {
+        ibv_port_attr attr{};
+        TORCH_CHECK(ibv_query_port(nic.ctx, g.port, &attr) == 0, "rdma gather: ibv_query_port ", name, " failed");
+        for (int i = 0; i < attr.gid_tbl_len; ++i) {
+            ibv_gid gid{};
+            if (ibv_query_gid(nic.ctx, g.port, i, &gid) != 0 || !ipv4_mapped(gid)) continue;
+            if (gid_type(name, g.port, i) != "RoCE v2") continue;
+            nic.gid_index = i;
+            break;
+        }
+        TORCH_CHECK(nic.gid_index >= 0, "rdma gather: no RoCE v2 IPv4-mapped GID index on ", name);
+    }
+    TORCH_CHECK(ibv_query_gid(nic.ctx, g.port, nic.gid_index, &nic.gid) == 0, "rdma gather: ibv_query_gid failed");
     std::random_device rd;
     nic.qps.assign(world, nullptr);
     nic.psns.assign(world, 0);
@@ -601,6 +641,14 @@ std::vector<py::tuple> local_info(int64_t h) {
     return out;
 }
 
+// The GID index each opened device settled on (g.gid_index < 0: auto-selected per device), for the engine's log line.
+std::vector<int64_t> gid_indexes(int64_t h) {
+    Gather& g = get(h);
+    std::vector<int64_t> out;
+    for (const auto& nic : g.nics) out.push_back(nic.gid_index);
+    return out;
+}
+
 void link_peers(int64_t h, const std::vector<py::tuple>& remote) {
     Gather& g = get(h);
     TORCH_CHECK((int)remote.size() == g.world, "rdma gather: one entry a rank");
@@ -625,7 +673,7 @@ void link_peers(int64_t h, const std::vector<py::tuple>& remote) {
             rtr.min_rnr_timer = 12;
             rtr.ah_attr.is_global = 1;
             std::memcpy(rtr.ah_attr.grh.dgid.raw, peer.gid[d].data(), 16);
-            rtr.ah_attr.grh.sgid_index = g.gid_index;
+            rtr.ah_attr.grh.sgid_index = g.nics[d].gid_index;
             rtr.ah_attr.grh.hop_limit = 64;
             rtr.ah_attr.port_num = g.port;
             TORCH_CHECK(ibv_modify_qp(g.nics[d].qps[p], &rtr,
@@ -847,6 +895,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("reduce_finish", &reduce_finish);
     m.def("create", &create);
     m.def("local_info", &local_info);
+    m.def("gid_indexes", &gid_indexes);
     m.def("connect", &link_peers);
     m.def("start", &start);
     m.def("stop", &stop);
