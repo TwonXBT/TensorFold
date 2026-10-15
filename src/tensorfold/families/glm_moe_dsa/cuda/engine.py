@@ -92,10 +92,16 @@ class GlmEngine:
         from .decode import DEPTH_COST
         from .multi import CUT_STREAMS, DRAFT_CUT, EXTENTS, FILL_ROWS, KEEP, QUICK_ROWS
 
+        # TF_GLM_COPY_DRAFTS=1: a reply that repeats earlier text drafts its continuation (prompt lookup) ahead of
+        # the MTP head; every rank must agree, so the settings join the startup comparison below
+        from .copy_drafts import CopySettings
+
+        self.copy = None if serial_only else CopySettings.from_env(MAX_ROWS - 1)
         mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(latent.ENABLED),
                 prefill_rows, int(embed_split()), kv8.mode_code(kv8.MODE), draft_vocab(), G, streams,
                 FILL_ROWS if streams > 1 else 0, QUICK_ROWS if streams > 1 else 0, int(DEPTH_COST * 1e6),
-                int(KEEP), int(EXTENTS), int(DRAFT_CUT * 1e6), CUT_STREAMS]
+                int(KEEP), int(EXTENTS), int(DRAFT_CUT * 1e6), CUT_STREAMS] + \
+            (self.copy.code() if self.copy is not None else [0] * len(CopySettings().code()))
         both = self._gather_ints(mine)
         if any(row != both[0] for row in both):
             raise RuntimeError("the ranks were started with different settings (draft model, context, TF_GLM_LATENT,"
@@ -103,6 +109,9 @@ class GlmEngine:
                                "TF_GLM_FILL_ROWS, TF_GLM_QUICK_ROWS, TF_GLM_DEPTH_COST, TF_GLM_KEEP_SLOTS, "
                                "TF_GLM_EXTENTS, TF_GLM_DRAFT_CUT, TF_GLM_DRAFT_CUT_STREAMS):"
                                f" rank 0 {both[0]} vs {both[1:]}; give every rank the same flags")
+        if rank == 0 and self.copy is not None:
+            print(f"[tensorfold] copy drafts: up to {self.copy.most} a round, match {self.copy.match} tokens "
+                  "(TF_GLM_COPY_DRAFTS=1)", flush=True)
         if rank == 0 and kv8.parse(kv8.MODE) != ("bf16", "bf16"):
             lat, idx = kv8.parse(kv8.MODE)
             name = {"bf16": "bf16", "fp8": "FP8 (e4m3, a power-of-two scale a token)"}
@@ -310,15 +319,19 @@ class GlmEngine:
         policy = None
         if code[0]:
             policy = AcceptPolicy(code[1]) if DEPTH_COST > 0 else DepthPolicy(code[1], fixed=True)
+        copies = None
+        if policy is not None and self.w.mtp is not None and draft and self.copy is not None:
+            copies = self.copy.drafts(list(prompt) + [first], hybrid=False)   # prompt and pending token, alike on every rank
         res = (serial_decode(self.e, first, max_tokens, sampling, stop_eos=stop_eos, on_tokens=on_tokens)
                if policy is None or self.w.mtp is None or not draft
                else mtp_decode(self.e, first, max_tokens, sampling, policy=policy, stop_eos=stop_eos,
-                               on_tokens=on_tokens))
+                               on_tokens=on_tokens, copies=copies))
         stats.update(decode_s=res.seconds, rounds=res.rounds, tokens_per_second=round(res.tokens_per_second, 3),
                      sha256=__import__("hashlib").sha256(json.dumps(res.tokens).encode()).hexdigest()[:16])
         if self.w.comm is None or self.w.rank == 0:
+            copy_note = f" copy {res.copy_rounds}/{res.copy_accepted} kept" if getattr(res, "copy_rounds", 0) else ""
             print(f"[tensorfold] decode {len(res.tokens)} tok {res.tokens_per_second:.2f} tok/s rounds {res.rounds}"
-                  f" drafted {res.drafted} accepted {res.accepted}", flush=True)
+                  f" drafted {res.drafted} accepted {res.accepted}{copy_note}", flush=True)
         return stats
 
 
