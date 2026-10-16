@@ -288,8 +288,13 @@ def test_a_prompt_chunks_tap_rows_equal_the_decode_paths(tmp_path, monkeypatch, 
         if not close:
             bad = (~torch.isclose(prompt.float(), decode.float(), atol=1e-3, rtol=2e-2, equal_nan=True)) \
                 .any(dim=1).nonzero().flatten()
+            far = ~torch.isclose(prompt.float(), decode.float(), atol=1e-3, rtol=2e-2, equal_nan=True)
+            diff = (prompt.float() - decode.float()).abs().nan_to_num(0.0)
+            i, j = divmod(int(diff.argmax()), diff.shape[1])
             raise AssertionError(f"the prompt path's tap rows differ from the decode path's: {bad.numel()} rows, "
-                                 f"first at {int(bad[0]) if bad.numel() else -1}")
+                                 f"first at {int(bad[0]) if bad.numel() else -1}; {int(far.sum())} of "
+                                 f"{far.numel()} values; worst [{i},{j}] {float(prompt[i, j])} vs "
+                                 f"{float(decode[i, j])}; row {i} max |x| {float(prompt[i].float().abs().max())}")
     # and the drafter, fed by a real prefill, holds the same context either way
     from tensorfold.families.glm_moe_dsa.cuda.decode import prefill
 
@@ -362,3 +367,34 @@ def test_dspark_refuses_parallel_streams(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="single-stream"):
         GlmEngine(root / "model", rank=0, master="", port=0, comm=_NCopies(1), drafter=root / "dspark",
                   context=PROMPT, context_explicit=True, prefill_rows=256, parallel=2)
+
+
+@pytest.mark.parametrize("sampled", [False, True], ids=["greedy", "seeded"])
+def test_dspark_replies_equal_the_serial_reply(tmp_path, monkeypatch, sampled):
+    """The exactness argument made executable: the reply of dflash_decode (DSpark drafts, with and without copy
+    drafts) is the serial reply, token for token, greedy and seeded-sampled; the drafter's context tracks the
+    committed prefix every round (context_end == st.pos at the end)."""
+
+    from tensorfold.engine.exact_sampling import Sampling
+    from tensorfold.families.glm5_next.cuda.decode import DepthPolicy
+    from tensorfold.families.glm_moe_dsa.cuda.copy_drafts import CopySettings
+    from tensorfold.families.glm_moe_dsa.cuda.decode import dflash_decode, prefill, serial_decode
+
+    eng = _engine(tmp_path / "x", monkeypatch, 1, drafter=True)
+    e, d = eng.e, eng.drafter
+    sampling = Sampling(seed=1234, temperature=0.8, top_k=40, top_p=0.9, min_p=0.0) if sampled else None
+    prompt = [3, 9, 27, 81, 5, 25] * 20                      # a repeating prompt: copy drafts find matches
+    n = 40
+
+    first = prefill(e, prompt, sampling, drafter=d)
+    want = serial_decode(e, first, n, sampling).tokens
+
+    for copy in (False, True):
+        e.kept = None
+        first2 = prefill(e, prompt, sampling, drafter=d)
+        assert first2 == first
+        copies = CopySettings.from_env(7, env={"TF_GLM_COPY_DRAFTS": "1"}).drafts(list(prompt) + [first2], hybrid=False) if copy else None
+        res = dflash_decode(e, d, first2, n, sampling, policy=DepthPolicy(7, fixed=True), copies=copies)
+        assert res.tokens == want, (copy, res.tokens, want)
+        assert d.context_end == e.st.pos                   # every kept row reached the drafter
+        assert res.drafted > 0 and res.rounds <= n

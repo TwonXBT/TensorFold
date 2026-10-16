@@ -108,7 +108,8 @@ def prefill(e: "Engine", prompt: Sequence[int], sampling, drafter=None, **_) -> 
         st.set_mtp_len(cut)
     e.cached = cut
     last = None
-    use_mtp = w.mtp is not None and not getattr(e, "serial_only", False)
+    # a DSpark drafter replaces the MTP head as the drafter: its prompt rows would be absorbed for nothing
+    use_mtp = w.mtp is not None and not getattr(e, "serial_only", False) and drafter is None
     with invariant.suspended(cut == 0 and len(prompt) <= short):
         for start in range(cut, len(prompt), e.prefill_rows):
             chunk = list(prompt[start:start + e.prefill_rows])
@@ -284,6 +285,85 @@ def mtp_decode(e: "Engine", pending: int, count: int, sampling, *, policy: Depth
             drafts = (draft(e, e.main_hidden(slice(0, keep)), sampled[:keep], st.pos + 1, depth, sampling,
                             policy.confidence) if depth > 0 else [])
         stages["draft"] += time.perf_counter() - t4
+    torch.cuda.synchronize()
+    res = DecodeResult(out[:count], time.perf_counter() - start, rounds, drafted, accepted, stages, depths, keeps)
+    res.copy_rounds, res.copy_drafted, res.copy_accepted = c_rounds, c_drafted, c_accepted
+    return res
+
+
+@torch.no_grad()
+def dflash_decode(e: "Engine", drafter, pending: int, count: int, sampling, *, policy: DepthPolicy | None = None,
+                  stop_eos: bool = False, on_tokens=None, copies=None) -> DecodeResult:
+    """The DSpark verify loop (Mia-AiLab's ``dflash_decode``, Apache-2.0, over this family's ``commit``): pending plus
+    the drafter's chain, kept through the first mismatch, and the kept rows' taps absorbed into the drafter's context
+    after every round, so its context is always the committed prefix (prefill fed the prompt's). ``copies``: a
+    ``copy_drafts.CopyDrafts`` of the prompt and reply so far; a round it proposes for drafts the copied tokens
+    instead of running the drafter's block (the kept taps are still absorbed), and the depth policy is fed (0, 0)
+    after it, so copy rounds never move the DSpark depth. Drafts only propose: the reply is the serial sample.
+    """
+
+    import time
+
+    from . import forward as fwd
+
+    w, st, b = e.w, e.st, e.buf
+    policy = policy or DepthPolicy(7, fixed=True)
+    out = [pending]
+    stages = dict(draft=0.0, forward=0.0, sample=0.0, commit=0.0)
+    rounds = drafted = accepted = 0
+    c_rounds = c_drafted = c_accepted = 0
+    depths: list[int] = []
+    keeps: list[int] = []
+    if drafter.context_end != st.pos:
+        raise RuntimeError(f"dflash_decode: the drafter's context ({drafter.context_end}) is not the committed "
+                           f"prefix ({st.pos}): prefill must feed it (prefill(..., drafter=...))")
+    torch.cuda.synchronize()
+    start = time.perf_counter()
+    depth = min(policy.next(0, 0), count - len(out))
+    while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
+        t0 = time.perf_counter()
+        copied = copies.propose(copy_room(copies, count, out)) if copies is not None else []
+        if copied:
+            drafts = copied
+        else:
+            drafts = drafter.propose(out[-1], depth, sampling, policy.confidence) if depth > 0 else []
+        t1 = time.perf_counter()
+        tokens = e.verify_window([out[-1]] + list(drafts))
+        drafts = tokens[1:]
+        R = len(tokens)
+        logits = e.forward(tokens)
+        torch.cuda.synchronize()
+        t2 = time.perf_counter()
+        sampled = e.sample(logits[:R], [st.pos + 1 + r for r in range(R)], sampling)
+        keep = 1
+        for i, d in enumerate(drafts):
+            if sampled[i] != d or (stop_eos and sampled[i] in w.cfg.eos):
+                break
+            keep += 1
+        t3 = time.perf_counter()
+        fwd.commit(w, st, b, R, keep)
+        t4 = time.perf_counter()
+        drafter.add_taps(e.tap_rows(keep))      # the kept rows (pending + accepted drafts): the committed prefix
+        t5 = time.perf_counter()
+        rounds += 1
+        drafted += len(drafts)
+        accepted += keep - 1
+        if copied:
+            c_rounds, c_drafted, c_accepted = c_rounds + 1, c_drafted + len(drafts), c_accepted + keep - 1
+        depths.append(len(drafts))
+        keeps.append(keep)
+        e.follow(sampled[:keep])
+        out.extend(sampled[:keep])
+        if copies is not None:
+            copies.extend(sampled[:keep])
+        if on_tokens is not None:
+            on_tokens(sampled[:keep][:max(0, count - (len(out) - keep))])
+        stages["draft"] += (t1 - t0) + (t5 - t4)
+        stages["forward"] += t2 - t1
+        stages["sample"] += t3 - t2
+        stages["commit"] += t4 - t3
+        # a copied round's acceptance says nothing about the drafter's chain: it does not move the depth
+        depth = min(policy.next(*((0, 0) if copied else (len(drafts), keep - 1))), count - len(out))
     torch.cuda.synchronize()
     res = DecodeResult(out[:count], time.perf_counter() - start, rounds, drafted, accepted, stages, depths, keeps)
     res.copy_rounds, res.copy_drafted, res.copy_accepted = c_rounds, c_drafted, c_accepted

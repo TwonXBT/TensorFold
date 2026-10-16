@@ -17,6 +17,11 @@ PROMPT_ROWS = int(os.environ.get("TF_GLM_PREFILL_ROWS") or 8192)
 # against 77.7 at 2,048, 64k context, before the rotated expert rows went lazy), counted by the startup estimate
 PROMPT_ROW_BYTES = 860_000
 GRAPH_ROWS = (1, 2, 3, 4, 5, 6)       # verify windows captured as CUDA graphs
+# a DSpark drafter (--drafter): drafts a round (TF_GLM_DSPARK_DEPTH, at most MAX_ROWS - 1 = 7, its block of 8 less the
+# pending token) and the confidence-product cut of its chain (TF_GLM_DSPARK_CONFIDENCE; 0: always the full depth);
+# both change proposals, so the ranks' settings comparison carries them
+DSPARK_DEPTH = min(int(os.environ.get("TF_GLM_DSPARK_DEPTH") or MAX_ROWS - 1), MAX_ROWS - 1)
+DSPARK_CONFIDENCE = float(os.environ.get("TF_GLM_DSPARK_CONFIDENCE") or 0.0)
 DENSE_CAPACITY = 2560                 # cache slots while DSA attention stays dense (contexts up to 2,048 tokens)
 DEFAULT_POLICY = "auto"
 
@@ -114,7 +119,8 @@ class GlmEngine:
         mine = [int(drafter is not None), int(self.dspark), capacity, int(long_context), int(serial_only),
                 int(latent.ENABLED), prefill_rows, int(embed_split()), kv8.mode_code(kv8.MODE), draft_vocab(), G,
                 streams, FILL_ROWS if streams > 1 else 0, QUICK_ROWS if streams > 1 else 0, int(DEPTH_COST * 1e6),
-                int(KEEP), int(EXTENTS), int(DRAFT_CUT * 1e6), CUT_STREAMS] + \
+                int(KEEP), int(EXTENTS), int(DRAFT_CUT * 1e6), CUT_STREAMS,
+                DSPARK_DEPTH if self.dspark else 0, int(DSPARK_CONFIDENCE * 1e6) if self.dspark else 0] + \
             (self.copy.code() if self.copy is not None else [0] * len(CopySettings().code()))
         both = self._gather_ints(mine)
         if any(row != both[0] for row in both):
@@ -177,8 +183,10 @@ class GlmEngine:
                 from .dspark import Drafter
 
                 self.drafter = Drafter(drafter, w, capacity=capacity, tap_rows=MAX_ROWS, ring=True)
+            # a DSpark round verifies up to MAX_ROWS rows: every window width gets its graph
             self.e = Decoder(w, capacity=capacity, max_rows=MAX_ROWS, prefill_rows=prefill_rows, graphs=True,
-                             graph_rows=GRAPH_ROWS, long_context=long_context,
+                             graph_rows=tuple(range(1, MAX_ROWS + 1)) if self.dspark else GRAPH_ROWS,
+                             long_context=long_context,
                              taps=self.drafter.tap_layers if self.drafter is not None else ())
             if self.drafter is not None:
                 self.drafter.capture()
@@ -334,7 +342,7 @@ class GlmEngine:
 
     def _run_once(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool,
                   on_tokens: Callable[[list[int]], Any], code: list[int], draft: bool) -> dict[str, Any]:
-        from .decode import DEPTH_COST, AcceptPolicy, DepthPolicy, mtp_decode, prefill, serial_decode
+        from .decode import DEPTH_COST, AcceptPolicy, DepthPolicy, dflash_decode, mtp_decode, prefill, serial_decode
 
         t0 = time.perf_counter()
         first = prefill(self.e, prompt, sampling, drafter=self.drafter)
@@ -345,19 +353,27 @@ class GlmEngine:
         policy = None
         if code[0]:
             policy = AcceptPolicy(code[1]) if DEPTH_COST > 0 else DepthPolicy(code[1], fixed=True)
+        dspark = self.drafter is not None and policy is not None and draft
+        if dspark:                              # the DSpark drafter drafts instead of the MTP head (its own depth)
+            policy = DepthPolicy(DSPARK_DEPTH, fixed=True, confidence=DSPARK_CONFIDENCE)
         copies = None
-        if policy is not None and self.w.mtp is not None and draft and self.copy is not None:
+        if policy is not None and (self.w.mtp is not None or dspark) and draft and self.copy is not None:
             copies = self.copy.drafts(list(prompt) + [first], hybrid=False)   # prompt and pending token, alike on every rank
-        res = (serial_decode(self.e, first, max_tokens, sampling, stop_eos=stop_eos, on_tokens=on_tokens)
-               if policy is None or self.w.mtp is None or not draft
-               else mtp_decode(self.e, first, max_tokens, sampling, policy=policy, stop_eos=stop_eos,
-                               on_tokens=on_tokens, copies=copies))
+        if dspark:
+            res = dflash_decode(self.e, self.drafter, first, max_tokens, sampling, policy=policy, stop_eos=stop_eos,
+                                on_tokens=on_tokens, copies=copies)
+        elif policy is None or self.w.mtp is None or not draft:
+            res = serial_decode(self.e, first, max_tokens, sampling, stop_eos=stop_eos, on_tokens=on_tokens)
+        else:
+            res = mtp_decode(self.e, first, max_tokens, sampling, policy=policy, stop_eos=stop_eos,
+                             on_tokens=on_tokens, copies=copies)
         stats.update(decode_s=res.seconds, rounds=res.rounds, tokens_per_second=round(res.tokens_per_second, 3),
                      sha256=__import__("hashlib").sha256(json.dumps(res.tokens).encode()).hexdigest()[:16])
         if self.w.comm is None or self.w.rank == 0:
             copy_note = f" copy {res.copy_rounds}/{res.copy_accepted} kept" if getattr(res, "copy_rounds", 0) else ""
             print(f"[tensorfold] decode {len(res.tokens)} tok {res.tokens_per_second:.2f} tok/s rounds {res.rounds}"
-                  f" drafted {res.drafted} accepted {res.accepted}{copy_note}", flush=True)
+                  f" drafted {res.drafted} accepted {res.accepted}{copy_note}{' dspark' if dspark else ''}",
+                  flush=True)
         return stats
 
 
