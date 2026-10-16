@@ -436,7 +436,8 @@ class Engine:
         self.graphs = None
         self.replays = {"main": 0, "sparse": 0, "mtp": 0, "sparse_mtp": 0, "eager": 0}
         if graphs:
-            self.graphs = Graphs(self, graph_rows, graph_rows)
+            # a drafter's tap points mean a DSpark drafter drafts: the MTP head never runs, so no MTP graphs
+            self.graphs = Graphs(self, graph_rows, () if taps else graph_rows)
 
     def reset(self) -> None:
         self.st.reset()
