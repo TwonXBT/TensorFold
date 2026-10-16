@@ -24,6 +24,15 @@ from .kvq import KvQ, rotate as _q_rotate, tile as _q_tile
 # decode windows keep a program a chunk (more programs a row) and _merge (TF_GLM_SPARSE_FUSED=0: every window does)
 FUSED_ROWS = 64 if os.environ.get("TF_GLM_SPARSE_FUSED", "1") != "0" else 1 << 30
 FUSED_LAUNCH = (4, 3)             # _sparse_rows_pe's warps and load stages
+# TF_GLM_DECODE_CH: keys a program of the decode windows' sparse attention (_sparse_chunks_pe; default CHUNK = 512).
+# A TP4 rank's 16 heads are one head block, so a decode row over its 2,048 selected keys was 4 programs a layer on
+# GB10's 48 SMs: ~135 us a layer whether 1 or 4 rows (latency, not work). Smaller chunks run more, shorter programs;
+# _merge folds the partials in chunk order, so every decode row keeps one arithmetic for any window (drafted ==
+# serial); the prompt chunks' fused kernel (_sparse_rows_pe) folds the same chunks in registers, so a prompt row
+# keeps the decode rows' bits as before (a resumed tail under FUSED_ROWS runs the decode kernel: resumed == fresh).
+DECODE_CH = int(os.environ.get("TF_GLM_DECODE_CH") or 512)
+if DECODE_CH % 32 or not 32 <= DECODE_CH <= 2048:
+    raise ValueError(f"TF_GLM_DECODE_CH={DECODE_CH}: a multiple of 32 keys from 32 to 2,048")
 # _sparse_rows_pe's keys a tile on prompt chunks: 16 (GB10, 2,048 rows x 2,048 tokens over a 38k bf16 latent: 5.6 ms
 # against 7.9 at the decode windows' 32; other bits: the online softmax rescales every 16 keys) or KT (32: the decode
 # windows' bits) (TF_GLM_PROMPT_KT)
@@ -368,11 +377,11 @@ def sparse_attention(qa: torch.Tensor, qp: torch.Tensor, cache, pcache: torch.Te
         # a prompt chunk: a program a row and head block, partials merged in registers (the decode windows' bits at
         # PROMPT_KT = KT)
         _sparse_rows_pe[(R, triton.cdiv(H, HB))](qa, qp, rows, scales, h32, pcache, tokens, counts, out, W=W, H=H,
-                                                 LW=LW, PW=PW, CH=CHUNK, SCALE=scale, HBT=HB, KTT=PROMPT_KT, KV8=kv8,
+                                                 LW=LW, PW=PW, CH=DECODE_CH, SCALE=scale, HBT=HB, KTT=PROMPT_KT, KV8=kv8,
                                                  QB=qb, QSC=qsc, num_warps=FUSED_LAUNCH[0],
                                                  num_stages=FUSED_LAUNCH[1])
         return
-    nch = triton.cdiv(W, CHUNK)
+    nch = triton.cdiv(W, DECODE_CH)
     n = nch * R * H
     po = torch.empty((n * LW,), dtype=torch.float32, device=qa.device)
     pm = torch.empty((n,), dtype=torch.float32, device=qa.device)
@@ -381,7 +390,8 @@ def sparse_attention(qa: torch.Tensor, qp: torch.Tensor, cache, pcache: torch.Te
     # 4 warps with 3 load stages keep the 8-warp single-stage launch's bits (tools/check_sparse_cfg.py) and take 29
     # instead of 40 us a decode row over 2,048 selected tokens on GB10
     _sparse_chunks_pe[(R, triton.cdiv(H, hb), nch)](qa, qp, rows, scales, h32, pcache, tokens, counts, po, pm, pl,
-                                                    R, W=W, H=H, LW=LW, PW=PW, CH=CHUNK, SCALE=scale, HBT=hb, KTT=KT,
+                                                    R, W=W, H=H, LW=LW, PW=PW, CH=DECODE_CH, SCALE=scale, HBT=hb,
+                                                    KTT=KT,
                                                     KV8=kv8, QB=qb, num_warps=4, num_stages=3)
     _merge[(R, H)](po, pm, pl, out, counts, R, H=H, LW=LW, NCH=nch, SPARSE=True, num_warps=4)
 

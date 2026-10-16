@@ -121,7 +121,8 @@ class GlmEngine:
                 streams, FILL_ROWS if streams > 1 else 0, QUICK_ROWS if streams > 1 else 0, int(DEPTH_COST * 1e6),
                 int(KEEP), int(EXTENTS), int(DRAFT_CUT * 1e6), CUT_STREAMS,
                 DSPARK_DEPTH if self.dspark else 0, int(DSPARK_CONFIDENCE * 1e6) if self.dspark else 0,
-                len(__import__('tensorfold.cuda.exl3.linear', fromlist=['PLAN_TABLE']).PLAN_TABLE)] + \
+                len(__import__('tensorfold.cuda.exl3.linear', fromlist=['PLAN_TABLE']).PLAN_TABLE),
+                __import__('tensorfold.families.glm_moe_dsa.cuda.mla_pe', fromlist=['DECODE_CH']).DECODE_CH] + \
             (self.copy.code() if self.copy is not None else [0] * len(CopySettings().code()))
         both = self._gather_ints(mine)
         if any(row != both[0] for row in both):
