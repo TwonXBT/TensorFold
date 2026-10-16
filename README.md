@@ -5,6 +5,10 @@
 > [bertholomus](https://github.com/bertholomus). Deployment recipe and measurements:
 > [bertholomus/glm-5.3-tensorfold-tp4-4xgb10](https://github.com/bertholomus/glm-5.3-tensorfold-tp4-4xgb10).
 
+> **This branch, `glm53-4spark`, is a further fork by [TwonXBT](https://github.com/TwonXBT):** `glm-dsa-tp4` merged with TensorFold 0.6.1, plus decode and
+> conversation-handling work for full GLM-5.3 on four DGX Sparks (DSpark drafter, copy drafts, conversation cache, GB10 tuning).
+> Setup, pinned weights and a copy-paste AI setup prompt: [`recipe/README.md`](recipe/README.md). Unofficial; credits are listed there.
+
 TensorFold serves language models on Apple Silicon and NVIDIA GPUs through an OpenAI-compatible API.
 Each model family supplies its own kernels and draft verification.
 

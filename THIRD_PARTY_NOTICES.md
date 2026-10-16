@@ -135,3 +135,11 @@ The multimodal rotary and image-feature integration is adapted from MiaAI-Lab's
 [Flash Next vision patch 0008](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/blob/a3aa89835022c55ca8e55008c37785954834e04f/patches/0008-flash-next-vision.patch),
 MIT License, Copyright (c) 2026 MiaAI-Lab. The license is included in `LICENSES/MiaAI-Lab-MIT.txt`.
 The port preserves the v0.5 CUDA execution APIs and adds an offline EXL3 vision adapter.
+
+
+## GLM-5.3 DSpark drafter and copy drafts (`glm53-4spark` branch)
+
+`families/glm_moe_dsa/cuda/dspark.py`, the copy-draft code (`copy_drafts.py`) and the hybrid verification in `decode.py` follow the DSpark, DFlash2 and
+prompt-lookup implementation in [MiaAI-Lab/GLM-5.3-EXL3-3x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-EXL3-3x-DGX-Sparks-TensorFold)
+(Apache-2.0, Copyright MiaAI-Lab), ported to this repository's `glm_moe_dsa` family (EXL3 head, vocabulary-split embedding, one residual stream).
+The drafter checkpoint is [RedHatAI/GLM-5.3-speculator.dspark](https://huggingface.co/RedHatAI/GLM-5.3-speculator.dspark) (GLM-5.3 License); it is not included in this repository.
