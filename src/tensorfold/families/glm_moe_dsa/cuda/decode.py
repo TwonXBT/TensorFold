@@ -80,12 +80,15 @@ def resume_cut(kept: Sequence[int] | None, prompt: Sequence[int], step: int, sho
 
 
 @torch.no_grad()
-def prefill(e: "Engine", prompt: Sequence[int], sampling, **_) -> int:
+def prefill(e: "Engine", prompt: Sequence[int], sampling, drafter=None, **_) -> int:
     """Commit the prompt in prompt chunks (this family's forward and state; no KDA, no taps) and sample its first token.
 
     MTP: the prompt's rows are absorbed into the MTP head's cache chunk by chunk, as Flash does, when the
     checkpoint has the head (``--no-drafts`` serves still absorb nothing: the MTP cache stays unused).
     A prompt that extends the last one resumes after the chunks they share (``resume_cut``; e.cached).
+    ``drafter``: a DSpark drafter fed the committed rows' taps chunk by chunk (``add_taps``); a resumed prompt rolls
+    its context back to the resume point (``Drafter.resume``: kept while its ring still holds the window there, else
+    reset, so drafts start shallow — replies are unchanged either way: drafts only propose).
     """
 
     from . import forward as fwd, invariant
@@ -98,6 +101,8 @@ def prefill(e: "Engine", prompt: Sequence[int], sampling, **_) -> int:
     cut = resume_cut(getattr(e, "kept", None), prompt, e.prefill_rows, short)
     e.kept = None                                    # (set again once this prompt is whole)
     e.reset()
+    if drafter is not None and not (cut and drafter.resume(cut)):
+        drafter.reset()
     if cut:
         st.set_pos(cut)
         st.set_mtp_len(cut)
@@ -118,6 +123,8 @@ def prefill(e: "Engine", prompt: Sequence[int], sampling, **_) -> int:
                     mtp_forward(w, st, b, nxt, b.fnormed[:len(nxt)])
                     st.set_mtp_len(st.mtp_len + len(nxt))
             fwd.commit(w, st, b, R, R)
+            if drafter is not None:
+                drafter.add_taps(e.tap_rows(R, b))   # the chunk's committed rows, in position order
     e.kept = list(prompt)
     if e.constraint is not None:
         e.window = e.constraint.window([0], [-1])
