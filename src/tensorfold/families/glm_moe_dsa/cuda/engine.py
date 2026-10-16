@@ -383,7 +383,11 @@ class GlmEngine:
                   f" drafted {res.drafted} accepted {res.accepted}{copy_note}"
                   + (f" dspark d{policy.most} c{policy.confidence:g} ms/round draft "
                      f"{1e3 * res.stages['draft'] / max(1, res.rounds):.1f} fwd "
-                     f"{1e3 * res.stages['forward'] / max(1, res.rounds):.1f}" if dspark else ""), flush=True)
+                     f"{1e3 * res.stages['forward'] / max(1, res.rounds):.1f} smp "
+                     f"{1e3 * res.stages['sample'] / max(1, res.rounds):.1f} cmt "
+                     f"{1e3 * res.stages['commit'] / max(1, res.rounds):.1f} rest "
+                     f"{1e3 * (res.seconds - sum(res.stages.values())) / max(1, res.rounds):.1f} total "
+                     f"{1e3 * res.seconds / max(1, res.rounds):.1f}" if dspark else ""), flush=True)
         return stats
 
 
