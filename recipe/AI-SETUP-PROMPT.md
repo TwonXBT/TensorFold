@@ -5,8 +5,8 @@ machine that can `ssh` to all four of your DGX Sparks. The agent will ask you a 
 
 ---
 
-You are my ops engineer. Set up the full GLM-5.3 model (EXL3 3.0 bpw) on my four NVIDIA DGX Sparks (GB10) with tensor parallelism 4,
-using the exact pinned sources below. Work step by step, verify each step before the next, and stop and ask me if anything differs from what
+You are my ops engineer. Set up the full GLM-5.3 model (EXL3 3.0 bpw) on my four NVIDIA DGX Sparks (GB10) with tensor parallelism 4, using the
+recipe in https://github.com/TwonXBT/TensorFold (engine tag glm53-4spark-v1, read recipe/README.md first) and the exact pinned sources below. Work step by step, verify each step before the next, and stop and ask me if anything differs from what
 is written here. Do not improvise versions, do not use different weights, and do not skip checksum verification.
 
 ## Ground rules
