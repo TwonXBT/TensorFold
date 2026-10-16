@@ -55,6 +55,7 @@ def test_split_selection_equals_replicated(fmt, R, pos, prompt, monkeypatch):
 
     want_t, want_c = run()
     monkeypatch.setattr(select, "SPLIT", True)
+    monkeypatch.setattr(select, "SPLIT_DECODE", 0)       # every decode window takes the split path here
     store: dict = {}
     for r in range(world):
         run(comm=_Comm(store, r, world, False), rank=r, world=world)
