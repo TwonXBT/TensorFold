@@ -422,11 +422,21 @@ def _select_split(qi, wts, keys, R: int, topk: int, pos_dev, tokens, counts, np_
     g = got.view(world, R, 2 * kl)
     s_all = g[:, :, :kl].permute(1, 0, 2).reshape(R, world * kl)
     p_all = g[:, :, kl:].contiguous().view(torch.int32).permute(1, 0, 2).reshape(R, world * kl)
-    bits = (s_all + 0.0).view(torch.int32)
-    key = torch.where(bits < 0, bits ^ 0x7FFFFFFF, bits).to(torch.int64).bitwise_left_shift_(32)
-    key.bitwise_or_(0xFFFFFFFF - p_all.to(torch.int64))
-    top = torch.topk(key, k, dim=1, sorted=False).indices
-    picked = torch.sort(torch.gather(p_all, 1, top), dim=1).values
+    if wide:
+        # prompt rows: _radix_topk over the candidates (a program a row). The rank blocks are in position order and
+        # each block ascending, so among finite scores a lower index is a lower position (_radix_topk's tie rule is the
+        # one below) and the picked indices come out ascending; padding (-inf, past every position) is never picked
+        # (a row with count > 0 has at least k finite candidates). torch.topk over int64 keys plus a sort was ~3 s of
+        # a 26k-token prefill (mbtopk passes and their elementwise ops)
+        idx = torch.zeros((R, k), dtype=torch.int32, device=dev)
+        _radix_topk[(R,)](s_all, s_all.stride(0), idx, idx.stride(0), world * kl, K=k, BLOCK=1024, num_warps=4)
+        picked = torch.gather(p_all, 1, idx.to(torch.int64))
+    else:
+        bits = (s_all + 0.0).view(torch.int32)
+        key = torch.where(bits < 0, bits ^ 0x7FFFFFFF, bits).to(torch.int64).bitwise_left_shift_(32)
+        key.bitwise_or_(0xFFFFFFFF - p_all.to(torch.int64))
+        top = torch.topk(key, k, dim=1, sorted=False).indices
+        picked = torch.sort(torch.gather(p_all, 1, top), dim=1).values
     width = tokens.shape[1]
     tokens.zero_()
     tokens[:, :k] = picked
