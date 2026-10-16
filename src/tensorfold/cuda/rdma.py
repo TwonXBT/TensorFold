@@ -86,6 +86,14 @@ class RdmaGather:
             raise RuntimeError("RDMA gather unavailable (" + "; ".join(bad) + ")")
         ext.start(self.h)
         atexit.register(ext.stop, self.h)
+        if os.environ.get("TF_RDMA_PROBE") == "1":     # probes on from the start (graphs capture the probing kernels)
+            ext.configure(self.h, True)
+
+    def probes(self) -> tuple[float, float, float, float]:
+        """Mean ns of (stage, doorbell -> every flag, copy-out) over the probed gathers since the last call, and their
+        count (TF_RDMA_PROBE=1 or ext.configure(h, True))."""
+
+        return tuple(self.ext.probes(self.h))
 
     def fits(self, send: torch.Tensor) -> bool:
         return send.dtype == torch.float32 and send.numel() % 4 == 0 and send.numel() * 4 <= self.max_bytes
