@@ -98,6 +98,11 @@ def prefill(e: "Engine", prompt: Sequence[int], sampling, drafter=None, **_) -> 
         raise ValueError("prefill requires at least one token")
     w, st, b = e.w, e.st, e.pbuf
     short = tiny_rows(w) if invariant.INVARIANT else 0   # a whole prompt this short: the decode kernels (as batched)
+    convs = getattr(e, "convs", None)       # parked conversations (TF_GLM_CONV_CACHE): may swap one in as e.kept
+    if convs is not None:
+        convs.arrange(e, prompt, drafter, e.prefill_rows, short)
+        if convs.note and w.rank == 0:
+            print(f"[tensorfold] {convs.note}", flush=True)
     cut = resume_cut(getattr(e, "kept", None), prompt, e.prefill_rows, short)
     e.kept = None                                    # (set again once this prompt is whole)
     e.reset()
@@ -430,6 +435,7 @@ class Engine:
             self.pbuf.set_taps(tuple(taps), w.cfg.hidden)
         self.mbuf = fwd.Buffers(w, max_rows, capacity) if w.mtp is not None else None
         self.st = fwd.State(w, capacity, max_rows)
+        self.convs = None                               # convcache.ConvCache (the engine attaches one)
         self.last_hidden: torch.Tensor | None = None
         self.constraint = self.window = None            # a request's grammar, and the next sample's rows under it
         self.draft_n = (w.head if w.draft_head is None else w.draft_head).n
