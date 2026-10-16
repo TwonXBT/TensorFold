@@ -63,6 +63,12 @@ COMM_PRIORITY = int(os.environ.get("TF_GLM_COMM_PRIORITY", "-1"))   # the comm s
 # the fp32 partial less; the same add); TF_GLM_SHARED_INLINE=0: after them, then part += sy. (On a stream of its own
 # beside the routed experts it was slower: 41.1 vs 40.4-40.9 s at 26k tokens on TP4.)
 SHARED_INLINE = os.environ.get("TF_GLM_SHARED_INLINE", "1") != "0"
+# TF_GLM_PROMPT_MOE_MERGE=1: a prompt chunk's MoE half runs the routed experts once over both micro-batches' rows (each
+# expert decodes its trellis once a chunk instead of once a micro-batch: the prompt experts are decode-bound), then
+# each micro-batch reduces on its comm stream as before. The experts' prompt kernels are row-invariant (the chunk-
+# invariant path relies on it), so every row keeps its bits; the first micro-batch's MoE reduce no longer hides
+# behind the second's experts.
+MOE_MERGE = os.environ.get("TF_GLM_PROMPT_MOE_MERGE", "0") == "1"
 
 
 class Pending:
@@ -605,7 +611,7 @@ def mlp_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
     return out_proj(w, b, b.act[:R], m.down, b.xs_act[:R], R)
 
 
-def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
+def moe_compute(layer: LayerW, w: Weights, b: Buffers, R: int) -> None:
     """Routed experts on ``tensorfold.cuda.exl3.experts`` (any width and codebook), then the shared expert, in fp32.
 
     The routed slots' weighted sum comes out of one fused launch in slot order (the shared expert's slot, id E,
@@ -651,8 +657,24 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
         shared(None)
     if not inline:
         b.part[:R].add_(b.sy[:R])
+
+
+def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
+    moe_compute(layer, w, b, R)
     with prof.timed("moe: all-gather"):
         return gather(w, b, R)
+
+
+def ffn_merged(layer: LayerW, w: Weights, b: Buffers, R: int, mbs, pend) -> list:
+    """MOE_MERGE: a prompt chunk's MoE half over both micro-batches at once (their RMSNorms, one routed-expert pass
+    over the chunk's R rows into b.part), then each micro-batch's reduce on its half of the comm buffers."""
+
+    with prof.timed("moe (total)"):
+        for i, (v, r, _pos, _hp) in enumerate(mbs):
+            norm_in(v, r, layer.post_norm, w.cfg.eps, pend[i])
+        moe_compute(layer, w, b, R)
+        with prof.timed("moe: all-gather"):
+            return [gather(w, v, r) for v, r, _pos, _hp in mbs]
 
 
 def norm_in(b, R: int, weight, eps: float, pre) -> None:
@@ -731,6 +753,9 @@ def prompt_layers(w: Weights, st: State, b: Buffers, R: int, nch: int | None, ho
         # index - 1 — the tap points. The decode path (compute) fills the same rows the direct
         # way, after layer_forward; both read x once the layer's residual is complete.
         fill_taps(b, layer, R, key=layer.index - 1)
+        if MOE_MERGE and layer.mlp is None:
+            pend = ffn_merged(layer, w, b, R, mbs, pend)
+            continue
         for i, (v, r, pos, hp) in enumerate(mbs):
             pend[i] = ffn_part(layer, w, v, r, pre=pend[i])
     for i, (v, r, pos, hp) in enumerate(mbs):
