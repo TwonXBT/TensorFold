@@ -346,11 +346,11 @@ def test_a_resumed_prompt_keeps_the_drafters_context(tmp_path, monkeypatch):
     assert np.array_equal(resumed[1], fresh[1], equal_nan=True)
     assert np.array_equal(resumed[2], fresh[2], equal_nan=True)
 
-    # a gap past the ring's spare cannot keep the window: the context resets
+    # a gap past the ring's spare cannot keep the window: the position still moves to the cut (stale context)
     end = d.context_end
-    assert not d.resume(end - (d.ring - d.span - d.block) - 1)
-    assert d.context_end == 0 and int(d.pos_dev.item()) == 0
-    assert not d.resume(0) and d.context_end == 0                # cut 0: a plain reset
+    cut = end - (d.ring - d.span - d.block) - 1
+    assert not d.resume(cut)
+    assert d.context_end == cut and int(d.pos_dev.item()) == cut
     del first_a
 
 
@@ -402,3 +402,50 @@ def test_dspark_replies_equal_the_serial_reply(tmp_path, monkeypatch, sampled):
         assert res.tokens == want, (copy, res.tokens, want)
         assert d.context_end == e.st.pos                   # every kept row reached the drafter
         assert res.drafted > 0 and res.rounds <= n
+
+
+@pytest.mark.parametrize("invariant_on", [False, True], ids=["chunked", "invariant"])
+def test_identical_prompt_twice_keeps_the_drafter_aligned(tmp_path, monkeypatch, invariant_on):
+    """The live failure 2026-10-16 01:45: the same prompt twice with the conversation cache (resume one row short of
+    the prompt) and DSpark decode between them; dflash_decode refused: drafter 361 vs committed 362."""
+
+    from tensorfold.families.glm5_next.cuda.decode import DepthPolicy
+    from tensorfold.families.glm_moe_dsa.cuda import invariant, multi
+    from tensorfold.families.glm_moe_dsa.cuda.decode import dflash_decode, prefill
+
+    monkeypatch.setattr(multi, "KEEP", True)
+    monkeypatch.setattr(invariant, "INVARIANT", invariant_on)
+    eng = _engine(tmp_path / "rep", monkeypatch, 1, drafter=True)
+    e, d = eng.e, eng.drafter
+    prompt = [3, 9, 27, 81, 5, 25] * 15
+    for i in range(3):
+        first = prefill(e, prompt, None, drafter=d)
+        print("round", i, "cut", e.cached, "drafter", d.context_end, "pos", e.st.pos)
+        assert d.context_end == e.st.pos, (i, e.cached, d.context_end, e.st.pos)
+        dflash_decode(e, d, first, 20, None, policy=DepthPolicy(7, fixed=True))
+
+
+def test_a_long_prompt_then_an_unrelated_short_one_keeps_the_drafter_aligned(tmp_path, monkeypatch):
+    """The live failure 2026-10-16 01:45: a long prompt, then a short unrelated one sharing only the template's first
+    tokens: the target resumes at that tiny cut while the drafter's ring cannot keep its window (small resume spare
+    here); the drafter must still sit at the cut, then the feed brings it to the target's position."""
+
+    from tensorfold.families.glm5_next.cuda.decode import DepthPolicy
+    from tensorfold.families.glm_moe_dsa.cuda import invariant, multi
+    from tensorfold.families.glm_moe_dsa.cuda.decode import dflash_decode, prefill
+
+    monkeypatch.setattr(multi, "KEEP", True)
+    monkeypatch.setattr(invariant, "INVARIANT", True)
+    monkeypatch.setenv("TF_GLM_DSPARK_RESUME_ROWS", "64")
+    eng = _engine(tmp_path / "rep2", monkeypatch, 1, drafter=True)
+    e, d = eng.e, eng.drafter
+    assert d.ring
+    long_prompt = [3, 4] + [7, 11, 13, 17, 19] * 56                       # 282 tokens
+    first = prefill(e, long_prompt, None, drafter=d)
+    dflash_decode(e, d, first, 8, None, policy=DepthPolicy(7, fixed=True))
+    short = [3, 4] + [23, 29, 31] * 40      # 122 tokens (past tiny_rows), sharing only the first 2 tokens
+    first = prefill(e, short, None, drafter=d)
+    assert e.cached == 1                                                     # resumed at a tiny cut
+    assert d.context_end == e.st.pos == len(short)
+    res = dflash_decode(e, d, first, 12, None, policy=DepthPolicy(7, fixed=True))
+    assert d.context_end == e.st.pos and len(res.tokens) == 12

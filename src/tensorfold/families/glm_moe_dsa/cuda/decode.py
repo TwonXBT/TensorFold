@@ -101,8 +101,8 @@ def prefill(e: "Engine", prompt: Sequence[int], sampling, drafter=None, **_) -> 
     cut = resume_cut(getattr(e, "kept", None), prompt, e.prefill_rows, short)
     e.kept = None                                    # (set again once this prompt is whole)
     e.reset()
-    if drafter is not None and not (cut and drafter.resume(cut)):
-        drafter.reset()
+    if drafter is not None:                          # aligned to the target's resume point either way
+        drafter.resume(cut) if cut else drafter.reset()
     if cut:
         st.set_pos(cut)
         st.set_mtp_len(cut)
