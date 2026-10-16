@@ -566,3 +566,61 @@ def test_a_growing_conversation_drops_the_parked_rows_it_reaches(tmp_path, monke
     assert e.convs.items == [] and e.st.ceiling == e.st.capacity
     prefill(e, A + [1, 2, 3], None, drafter=d)
     assert e.cached <= 2 and "restored" not in e.convs.note
+
+
+def test_conversations_swap_back_and_forth(tmp_path, monkeypatch):
+    """Three conversations in turn (A, B, a tiny one, then A, B, A again): every switch back resumes one row short of
+    that conversation's last prompt, the parked copies stay packed against the top of the planes (moves between
+    overlapping spans included), and the last turn's reply is the reply after a fresh prefill (serial)."""
+
+    from tensorfold.families.glm5_next.cuda.decode import DepthPolicy
+    from tensorfold.families.glm_moe_dsa.cuda.decode import dflash_decode, prefill, serial_decode
+
+    eng = _conv_engine(tmp_path, monkeypatch, "swap")
+    e, d = eng.e, eng.drafter
+    cap = e.st.capacity
+
+    def turn(prompt, n=6):
+        first = prefill(e, prompt, None, drafter=d)
+        out = dflash_decode(e, d, first, n, None, policy=DepthPolicy(7, fixed=True)).tokens
+        assert d.context_end == e.st.pos
+        return [first] + out
+
+    def packed():
+        top = cap
+        for p in sorted(e.convs.items, key=lambda p: -p.start):
+            assert p.end == top, [(q.start, q.rows) for q in e.convs.items]
+            top = p.start
+
+    A = [3, 4] + [7, 11, 13, 17, 19] * 140                                 # 702 tokens
+    B = [3, 4] + [23, 29, 31] * 166                                        # 500 tokens
+    S = [3, 4] + [41, 43] * 9                                              # 20 tokens (tiny)
+    ra = turn(A)
+    rb = turn(B)
+    turn(S)
+    packed()
+    assert sorted(p.rows for p in e.convs.items) == [len(B), len(A)]
+    A2 = A + ra + [5, 6] * 10
+    ra2 = turn(A2)
+    assert e.cached == len(A) - 1, e.convs.note
+    packed()
+    B2 = B + rb + [8, 9] * 10
+    rb2 = turn(B2)
+    assert e.cached == len(B) - 1, e.convs.note
+    packed()
+    A3 = A2 + ra2 + [10, 12] * 10
+    got_first = prefill(e, A3, None, drafter=d)
+    assert e.cached == len(A2) - 1, e.convs.note
+    packed()
+    got = dflash_decode(e, d, got_first, 20, None, policy=DepthPolicy(7, fixed=True)).tokens
+    B3 = B2 + rb2 + [14, 15] * 10
+    prefill(e, B3, None, drafter=d)
+    assert e.cached == len(B2) - 1, e.convs.note
+
+    e.kept = None
+    e.convs.items = []
+    e.convs._ceiling()
+    want_first = prefill(e, A3, None, drafter=d)
+    assert e.cached == 0
+    want = serial_decode(e, want_first, 20, None).tokens
+    assert (got_first, got) == (want_first, want)
