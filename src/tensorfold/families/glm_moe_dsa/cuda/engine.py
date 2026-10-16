@@ -140,6 +140,7 @@ class GlmEngine:
                 int(__import__('tensorfold.families.glm_moe_dsa.cuda.select', fromlist=['SPLIT']).SPLIT),
                 __import__('tensorfold.families.glm_moe_dsa.cuda.select', fromlist=['SPLIT_DECODE']).SPLIT_DECODE,
                 int(__import__('tensorfold.families.glm_moe_dsa.cuda.forward', fromlist=['MOE_MERGE']).MOE_MERGE),
+                int(__import__('tensorfold.families.glm_moe_dsa.cuda.forward', fromlist=['PREFETCH']).PREFETCH * 1024),
                 __import__('tensorfold.families.glm_moe_dsa.cuda.convcache', fromlist=['MAX']).MAX,
                 __import__('tensorfold.families.glm_moe_dsa.cuda.convcache', fromlist=['MIN_ROWS']).MIN_ROWS] + \
             (self.copy.code() if self.copy is not None else [0] * len(CopySettings().code()))
@@ -150,7 +151,7 @@ class GlmEngine:
                                "TF_GLM_FILL_ROWS, TF_GLM_QUICK_ROWS, TF_GLM_DEPTH_COST, TF_GLM_KEEP_SLOTS, "
                                "TF_GLM_EXTENTS, TF_GLM_DRAFT_CUT, TF_GLM_DRAFT_CUT_STREAMS, TF_GLM_DSPARK_DEPTH, "
                                "TF_GLM_DSPARK_CONFIDENCE, TF_GLM_X3_PLAN, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, "
-                               "TF_GLM_DECODE_CH, TF_GLM_DECODE_LAUNCH, TF_GLM_SELECT_SPLIT(_DECODE), TF_GLM_PROMPT_MOE_MERGE, TF_GLM_CONV_CACHE, TF_GLM_CONV_CACHE_MIN, "
+                               "TF_GLM_DECODE_CH, TF_GLM_DECODE_LAUNCH, TF_GLM_SELECT_SPLIT(_DECODE), TF_GLM_PROMPT_MOE_MERGE, TF_GLM_PREFETCH, TF_GLM_CONV_CACHE, TF_GLM_CONV_CACHE_MIN, "
                                "TF_GLM_COPY_*):"
                                f" rank 0 {both[0]} vs {both[1:]}; give every rank the same flags")
         if rank == 0 and self.copy is not None:
