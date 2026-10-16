@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from functools import lru_cache
 from typing import Sequence
 
 import torch
@@ -44,6 +45,83 @@ STAGE_BLOCKS = int(os.environ.get("TF_RDMA_STAGE_BLOCKS") or 8)
 # sends each peer only the rows that peer owns, owners sum in rank order and gather the bf16 branches back: 2.7x fewer
 # bytes, residual_add's arithmetic, the same bits; TP4 at 16 rows 82.9 -> 59.4 us a reduce + residual); 0: off
 REDUCE_ROWS = int(os.environ.get("TF_GLM_REDUCE_ROWS") or 9)
+# TF_GLM_PREFETCH: MiB of the next consumer's weights pulled into L2 on the side stream while a decode window's
+# all-gather waits on the network (l2_prefetch.cu; the GPU is otherwise idle for ~15 us a gather, 156 a forward):
+# after the attention gather the layer's router and shared expert, after the MoE gather the next layer's q_a, kv_a,
+# indexer wq_b and q_b (the head after the last layer). The bytes are read once either way, a hint only; 0: off.
+# TF_GLM_PREFETCH_BLOCKS: blocks issuing the prefetches (default 4)
+PREFETCH = float(os.environ.get("TF_GLM_PREFETCH") or 0)
+PREFETCH_BLOCKS = int(os.environ.get("TF_GLM_PREFETCH_BLOCKS") or 4)
+
+
+@lru_cache(maxsize=1)
+def _pf_ext():
+    from pathlib import Path
+
+    from tensorfold.cuda.build import load
+
+    return load(name="tensorfold_glm_l2_prefetch_v1", sources=[str(Path(__file__).parent / "l2_prefetch.cu")],
+                extra_cuda_cflags=["-O3"], verbose=False)
+
+
+def _words(q) -> list:
+    """The device tensors an EXL3 projection reads, in reading order (plain tensors pass through; B16: none)."""
+
+    if isinstance(q, X3Pair):
+        return [q.gate.lin.words, q.up.lin.words]
+    if isinstance(q, X3):
+        return [q.lin.words]
+    if isinstance(q, torch.Tensor):
+        return [q]
+    return []
+
+
+def prefetch_table(tensors, cap_bytes: int, device):
+    """(int64 [n, 2] device table of (pointer, bytes), n) over ``tensors`` in order up to ``cap_bytes``; None if empty."""
+
+    rows, budget = [], int(cap_bytes)
+    for t in tensors:
+        if t is None or budget <= 0:
+            continue
+        nb = min(t.numel() * t.element_size(), budget) & ~15
+        if nb <= 0:
+            continue
+        rows.append((t.data_ptr(), nb))
+        budget -= nb
+    if not rows:
+        return None
+    return torch.tensor(rows, dtype=torch.int64, device=device), len(rows)
+
+
+def prefetch_tables(w: Weights, device) -> tuple[list, list]:
+    """Per layer: the table for the attention gather (this layer's MoE weights) and for the MoE gather (the next
+    layer's attention weights; the head after the last layer)."""
+
+    cap = int(PREFETCH * (1 << 20))
+    attn, moe = [], []
+    for l in w.layers:
+        if l.moe is not None:
+            now = [l.moe.router] + (_words(l.moe.shared.gu) + _words(l.moe.shared.down) if l.moe.shared else [])
+        else:
+            now = _words(l.mlp.gu) + _words(l.mlp.down)
+        attn.append(prefetch_table(now, cap, device))
+        nxt = w.layers[l.index + 1] if l.index + 1 < len(w.layers) else None
+        if nxt is not None:
+            d = nxt.dsa
+            after = _words(d.q_a) + _words(d.kv_a) + (_words(d.index.qb) if d.index is not None else []) + _words(d.q_b)
+        else:
+            after = _words(w.head)
+        moe.append(prefetch_table(after, cap, device))
+    return attn, moe
+
+
+def _prefetch(b, pf) -> None:
+    """Issue a prefetch table on the side stream (after everything queued so far on the current stream)."""
+
+    if pf is None or b.side is None:
+        return
+    with fork(b):
+        _pf_ext().prefetch(pf[0], pf[1], PREFETCH_BLOCKS)
 
 
 # prompt chunks' routed experts (exl3.experts.routed's kernel): "mma3" (gate/up rotating its rows from the layer
@@ -109,9 +187,11 @@ def gather(w: Weights, b, R: int):
         if rdma is not None and part.is_contiguous() and rdma.fits(part.reshape(-1)):
             if REDUCE_ROWS and R >= REDUCE_ROWS:
                 rdma.reduce_stage(part.reshape(-1), R, part.shape[1], STAGE_BLOCKS)
+                _prefetch(b, getattr(b, "pf_now", None))
                 return PendingReduce(rdma, part)
             if FUSED_RESIDUAL:
                 rdma.stage(part.reshape(-1), STAGE_BLOCKS)
+                _prefetch(b, getattr(b, "pf_now", None))
                 return Pending(rdma, part)
     if not (b.prefill and PROMPT_REDUCE == "rows" and w.comm is not None and world > 2):
         return flash_gather(w, b, R)                     # (two ranks would save a quarter of the bytes)
@@ -272,9 +352,13 @@ class Buffers(FlashBuffers):
         self.comm_stream = (torch.cuda.Stream(device=dev, priority=COMM_PRIORITY) if prefill and dev.type == "cuda"
                             else None)
         self.pos_mb = torch.zeros((1,), dtype=torch.int32, device=dev)
+        self.pf_attn = self.pf_moe = None    # TF_GLM_PREFETCH tables (prefetch_tables); pf_now: the next gather's
+        self.pf_now = None
         if SIDE and not prefill and dev.type == "cuda":
             self.side = torch.cuda.Stream(device=dev)
             self.x3s = X3Scratch(w.meta.get("x3", []), dev, prefill=False)
+            if PREFETCH > 0:
+                self.pf_attn, self.pf_moe = prefetch_tables(w, dev)
         # dcp (TF_GLM_DCP): every head's absorbed query and the partials exchanged between the ranks
         self.dcp = (dcp_mod.Scratch(rows, share(c.heads, w.world, w.rank), c.kv_lora, c.qk_rope, w.world, dev)
                     if w.meta.get("dcp", 1) > 1 else None)
@@ -699,6 +783,7 @@ def attn_part(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch: int
 
     di = st.dsa_index[layer.index]
     c = w.cfg
+    b.pf_now = b.pf_attn[layer.index] if getattr(b, "pf_attn", None) is not None else None
     with prof.timed("dsa (total)"):
         # pre-attention RMSNorm (input_layernorm): the block reads b.normed / b.xs
         norm_in(b, R, layer.in_norm, c.eps, pre)
@@ -713,6 +798,7 @@ def attn_part(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch: int
 def ffn_part(layer: LayerW, w: Weights, b: Buffers, R: int, pre=None):
     """A layer's MLP / MoE half up to its gathered partials (``pre`` as in attn_part)."""
 
+    b.pf_now = b.pf_moe[layer.index] if getattr(b, "pf_moe", None) is not None else None
     with prof.timed("moe (total)" if layer.mlp is None else "mlp"):
         # post-attention RMSNorm before the MLP / MoE
         norm_in(b, R, layer.post_norm, w.cfg.eps, pre)
@@ -825,13 +911,18 @@ def compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, n
             layer_forward(layer, w, st, b, R, nch, host_pos, sparse_np)
             fill_taps(b, layer, R)
     if not logits:
+        if b.side is not None and getattr(b, "pf_moe", None) is not None:
+            join(b)                      # the last gather's prefetch (a captured side stream must be joined)
         return None
     glue.rmsnorm(b.x[:R], w.norm, c.eps, b.fnormed[:R], b.fxs[:R])
     if b.prefill:                        # the head reads the last row only (fnormed keeps every row for the MTP)
         if invariant.INVARIANT and isinstance(w.head, X3):      # (the decode linear, as without it)
             return w.head(b.fnormed[R - 1:R], b.logits[:1], b.x3, prefill=False)
         return mm(b, b.fnormed[R - 1:R], w.head, b.fxs[R - 1:R], b.logits[:1])
-    return mm(b, b.fnormed[:R], w.head, b.fxs[:R], b.logits[:R])
+    out = mm(b, b.fnormed[:R], w.head, b.fxs[:R], b.logits[:R])
+    if b.side is not None and getattr(b, "pf_moe", None) is not None:
+        join(b)
+    return out
 
 
 def compute_rows(w: Weights, st: State, b: Buffers, R: int, heads: torch.Tensor | None = None) -> torch.Tensor:
@@ -846,6 +937,8 @@ def compute_rows(w: Weights, st: State, b: Buffers, R: int, heads: torch.Tensor 
     for layer in w.layers:
         layer_forward(layer, w, st, b, R)
     glue.rmsnorm(b.x[:R], w.norm, c.eps, b.fnormed[:R], b.fxs[:R])
+    if b.side is not None and getattr(b, "pf_moe", None) is not None:
+        join(b)
     if heads is not None:
         k = heads.shape[0]
         torch.index_select(b.fnormed[:R], 0, heads, out=b.hidden[:k])
