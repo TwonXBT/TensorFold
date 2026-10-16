@@ -553,9 +553,12 @@ def dsa_block(layer: LayerW, w: Weights, lc, pos_dev: torch.Tensor, b: Buffers, 
         if a.index is not None and not reuse:
             with prof.timed("dsa: select tokens"):
                 index_inputs(w, b, a.index, R)
+                # SPLIT: a prompt micro-batch's selection gather rides its comm stream, as its reduces do
+                micro = getattr(b, "micro", False)
                 select_mod.select_tokens(b.qi[:R], b.iw[:R], index, host_pos, R, c.index_topk, pos_dev,
                                          tokens=b.tokens[:R], counts=b.counts[:R], bucket=sparse_np,
-                                         span=True if inv else None)
+                                         span=True if inv else None, comm=w.comm, rank=w.rank, world=w.world,
+                                         stream=getattr(b, "comm_stream", None) if micro else None)
         # a "shared" layer attends the tokens its group's full layer selected for these rows (still in b.tokens)
         with prof.timed("dsa: sparse attention"):
             mla_pe.sparse_attention(qa, qp, lc, pc, b.tokens[:R], b.counts[:R], ol, scale, qscratch=qs,
