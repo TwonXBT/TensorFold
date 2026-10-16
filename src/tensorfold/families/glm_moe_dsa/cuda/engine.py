@@ -135,14 +135,19 @@ class GlmEngine:
                 len(__import__('tensorfold.cuda.exl3.linear', fromlist=['PLAN_TABLE']).PLAN_TABLE), MAX_ROWS,
                 sum(r << (4 * i) for i, r in enumerate(WIDE_GRAPHS)),
                 __import__('tensorfold.families.glm_moe_dsa.cuda.mla_pe', fromlist=['DECODE_CH']).DECODE_CH,
-                int(__import__('tensorfold.families.glm_moe_dsa.cuda.select', fromlist=['SPLIT']).SPLIT)] + \
+                int(__import__('tensorfold.families.glm_moe_dsa.cuda.select', fromlist=['SPLIT']).SPLIT),
+                __import__('tensorfold.families.glm_moe_dsa.cuda.convcache', fromlist=['MAX']).MAX,
+                __import__('tensorfold.families.glm_moe_dsa.cuda.convcache', fromlist=['MIN_ROWS']).MIN_ROWS] + \
             (self.copy.code() if self.copy is not None else [0] * len(CopySettings().code()))
         both = self._gather_ints(mine)
         if any(row != both[0] for row in both):
             raise RuntimeError("the ranks were started with different settings (draft model, context, TF_GLM_LATENT,"
                                " TF_GLM_EMBED_SPLIT, TF_GLM_KV, TF_GLM_DRAFT_VOCAB, TF_GLM_DCP, --parallel, "
                                "TF_GLM_FILL_ROWS, TF_GLM_QUICK_ROWS, TF_GLM_DEPTH_COST, TF_GLM_KEEP_SLOTS, "
-                               "TF_GLM_EXTENTS, TF_GLM_DRAFT_CUT, TF_GLM_DRAFT_CUT_STREAMS):"
+                               "TF_GLM_EXTENTS, TF_GLM_DRAFT_CUT, TF_GLM_DRAFT_CUT_STREAMS, TF_GLM_DSPARK_DEPTH, "
+                               "TF_GLM_DSPARK_CONFIDENCE, TF_GLM_X3_PLAN, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, "
+                               "TF_GLM_DECODE_CH, TF_GLM_SELECT_SPLIT, TF_GLM_CONV_CACHE, TF_GLM_CONV_CACHE_MIN, "
+                               "TF_GLM_COPY_*):"
                                f" rank 0 {both[0]} vs {both[1:]}; give every rank the same flags")
         if rank == 0 and self.copy is not None:
             print(f"[tensorfold] copy drafts: up to {self.copy.most} a round, match {self.copy.match} tokens "
@@ -205,6 +210,15 @@ class GlmEngine:
                              taps=self.drafter.tap_layers if self.drafter is not None else ())
             if self.drafter is not None:
                 self.drafter.capture()
+            from . import convcache
+            from .multi import KEEP as _KEEP
+
+            if _KEEP and convcache.MAX > 0 and G == 1:
+                self.e.convs = convcache.ConvCache(self.e.st, comm=self.comm, world=world, rank=rank)
+                if rank == 0:
+                    print(f"[tensorfold] conversation cache: up to {convcache.MAX} conversations of at least "
+                          f"{convcache.MIN_ROWS} rows parked in the window's free rows "
+                          f"({self.e.convs.row_bytes} B a row)", flush=True)
         self.eos = tuple(w.cfg.eos)
         self.model_dir = Path(model_dir)
         self.request = threading.local()    # the calling request's policy and stop-at-EOS (``app.GlmApp``)

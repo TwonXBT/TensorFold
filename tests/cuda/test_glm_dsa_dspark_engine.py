@@ -479,3 +479,90 @@ def test_wide_copy_windows_keep_the_serial_reply(tmp_path, monkeypatch):
     assert res.tokens == want
     assert d.context_end == e.st.pos
     assert max(res.depths) <= 14
+
+
+def _conv_engine(tmp_path, monkeypatch, name: str, context: int = 1024):
+    """The tiny pair with the conversation cache: KEEP, the invariant prompt path, conversations of 64 rows or more
+    parked."""
+
+    from tensorfold.families.glm_moe_dsa.cuda import convcache, invariant, multi
+
+    monkeypatch.setattr(multi, "KEEP", True)
+    monkeypatch.setattr(invariant, "INVARIANT", True)
+    monkeypatch.setattr(convcache, "MAX", 4)
+    monkeypatch.setattr(convcache, "MIN_ROWS", 64)
+    eng = _engine(tmp_path / name, monkeypatch, 1, drafter=True, context=context)
+    assert eng.e.convs is not None
+    return eng
+
+
+def test_a_parked_conversation_comes_back_bit_for_bit(tmp_path, monkeypatch):
+    """TF_GLM_CONV_CACHE: conversation A, then an unrelated B (A parks in the window's top rows), then A's next turn:
+    A's prompt rows and the drafter's ring come back bit for bit, the turn resumes one row short of A's prompt, and
+    its reply is the reply after a fresh prefill of the whole turn (serial)."""
+
+    from tensorfold.families.glm5_next.cuda.decode import DepthPolicy
+    from tensorfold.families.glm_moe_dsa.cuda import convcache
+    from tensorfold.families.glm_moe_dsa.cuda.decode import dflash_decode, prefill, serial_decode
+
+    eng = _conv_engine(tmp_path, monkeypatch, "conv")
+    e, d = eng.e, eng.drafter
+    A = [3, 4] + [7, 11, 13, 17, 19] * 56                                  # 282 tokens
+    B = [3, 4] + [23, 29, 31] * 70                                         # 212 tokens, unrelated past the first 2
+    first = prefill(e, A, None, drafter=d)
+    rows_a = [t[:len(A)].clone() for t in convcache.planes(e.st)]
+    reply_a = dflash_decode(e, d, first, 16, None, policy=DepthPolicy(7, fixed=True)).tokens
+    ring_a = [t.clone() for t in list(d.kc) + list(d.vc)]
+    end_a = d.context_end
+
+    first_b = prefill(e, B, None, drafter=d)
+    assert "parked 282" in e.convs.note, e.convs.note
+    assert [p.rows for p in e.convs.items] == [len(A)]
+    dflash_decode(e, d, first_b, 16, None, policy=DepthPolicy(7, fixed=True))
+
+    seen = {}
+    restore = e.convs._restore
+
+    def check(p, drafter):
+        restore(p, drafter)
+        seen["rows"] = all(torch.equal(t[:len(A)], r) for t, r in zip(convcache.planes(e.st), rows_a))
+        seen["ring"] = all(torch.equal(t, r) for t, r in zip(list(d.kc) + list(d.vc), ring_a))
+        seen["end"] = d.context_end
+
+    monkeypatch.setattr(e.convs, "_restore", check)
+    A2 = A + [first] + reply_a + [5, 6, 8] * 10
+    got_first = prefill(e, A2, None, drafter=d)
+    assert seen == {"rows": True, "ring": True, "end": end_a}, seen
+    assert e.cached == len(A) - 1
+    assert "restored 282" in e.convs.note and "parked 212" in e.convs.note, e.convs.note
+    got = dflash_decode(e, d, got_first, 24, None, policy=DepthPolicy(7, fixed=True)).tokens
+    assert d.context_end == e.st.pos
+
+    e.kept = None                                    # the reference: a fresh prefill of the whole turn, serial
+    e.convs.items = []
+    e.convs._ceiling()
+    want_first = prefill(e, A2, None, drafter=d)
+    assert e.cached == 0
+    want = serial_decode(e, want_first, 24, None).tokens
+    assert (got_first, got) == (want_first, want)
+
+
+def test_a_growing_conversation_drops_the_parked_rows_it_reaches(tmp_path, monkeypatch):
+    """The live conversation's rows win: a reply that grows into a parked conversation's rows drops it (forward.
+    check_room -> State.spill) before any row is written there; a later turn of it starts fresh."""
+
+    from tensorfold.families.glm_moe_dsa.cuda.decode import prefill, serial_decode
+
+    eng = _conv_engine(tmp_path, monkeypatch, "spill")
+    e, d = eng.e, eng.drafter
+    A = [3, 4] + [7, 11, 13, 17, 19] * 56
+    B = [3, 4] + [23, 29, 31] * 70
+    prefill(e, A, None, drafter=d)
+    first = prefill(e, B, None, drafter=d)
+    (p,) = e.convs.items
+    assert e.st.ceiling == p.start
+    n = p.start - len(B)                             # past the margin below the parked rows
+    serial_decode(e, first, n, None)
+    assert e.convs.items == [] and e.st.ceiling == e.st.capacity
+    prefill(e, A + [1, 2, 3], None, drafter=d)
+    assert e.cached <= 2 and "restored" not in e.convs.note

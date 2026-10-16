@@ -740,6 +740,9 @@ def prompt_layers(w: Weights, st: State, b: Buffers, R: int, nch: int | None, ho
 
 def check_room(w: Weights, st: State, R: int, pos: int | None = None) -> None:
     pos = st.pos if pos is None else pos
+    ceiling = getattr(st, "ceiling", None)      # parked conversations above the live one (convcache) give way
+    if ceiling is not None and pos + R + 256 > ceiling:
+        st.spill(pos + R)
     if pos + R > w.cfg.dense_limit and st.index is None:
         raise ValueError(f"context {pos + R} past {w.cfg.dense_limit} tokens: this engine was started without long "
                          "contexts (DSA's sparse top-k)")
