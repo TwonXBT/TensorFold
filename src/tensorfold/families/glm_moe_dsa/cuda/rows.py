@@ -17,6 +17,7 @@ import triton
 import triton.language as tl
 
 from tensorfold.families.glm5_next.cuda.latent import CHUNK, HB, KT, _merge
+from .mla_pe import DECODE_CH
 
 # a round's dense attention stores no partials for chunks past a row's position and its merge reads none
 # (_merge_rows: the stored values' constants instead): the same bits; at chat / code positions (a few hundred tokens)
@@ -336,13 +337,13 @@ def sparse_attention(qa: torch.Tensor, qp: torch.Tensor, cache, pcache: torch.Te
     PW = qp.shape[2]
     W = tokens.shape[1]
     rows, scales, h32, kv8, qb = _planes(cache)
-    nch = triton.cdiv(W, CHUNK)
+    nch = triton.cdiv(W, DECODE_CH)                 # mla_pe.DECODE_CH: the single-stream decode rows' chunks
     n = nch * R * H
     po = torch.empty((n * LW,), dtype=torch.float32, device=qa.device)
     pm = torch.empty((n,), dtype=torch.float32, device=qa.device)
     pl = torch.empty((n,), dtype=torch.float32, device=qa.device)
     _sparse_rows[(R, triton.cdiv(H, HB), nch)](qa, qp, rows, scales, h32, pcache, tokens, counts, t.base, po, pm, pl,
-                                               R, W=W, H=H, LW=LW, PW=PW, CH=CHUNK, SCALE=scale, HBT=HB, KTT=KT,
+                                               R, W=W, H=H, LW=LW, PW=PW, CH=DECODE_CH, SCALE=scale, HBT=HB, KTT=KT,
                                                KV8=kv8, QB=qb, num_warps=4, num_stages=3)
     _merge[(R, H)](po, pm, pl, out, counts, R, H=H, LW=LW, NCH=nch, SPARSE=True, num_warps=4)
 
