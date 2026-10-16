@@ -110,7 +110,9 @@ def prefetch_tables(w: Weights, device) -> tuple[list, list]:
             d = nxt.dsa
             after = _words(d.q_a) + _words(d.kv_a) + (_words(d.index.qb) if d.index is not None else []) + _words(d.q_b)
         else:
-            after = _words(w.head)
+            # not the head: a rank's 178 MB gains nothing from a few MB, and prefetches still in flight after the
+            # forward slowed the DSpark drafter's round (3.0 -> 4.8 ms)
+            after = []
         moe.append(prefetch_table(after, cap, device))
     return attn, moe
 
