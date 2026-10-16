@@ -120,7 +120,8 @@ class GlmEngine:
                 int(latent.ENABLED), prefill_rows, int(embed_split()), kv8.mode_code(kv8.MODE), draft_vocab(), G,
                 streams, FILL_ROWS if streams > 1 else 0, QUICK_ROWS if streams > 1 else 0, int(DEPTH_COST * 1e6),
                 int(KEEP), int(EXTENTS), int(DRAFT_CUT * 1e6), CUT_STREAMS,
-                DSPARK_DEPTH if self.dspark else 0, int(DSPARK_CONFIDENCE * 1e6) if self.dspark else 0] + \
+                DSPARK_DEPTH if self.dspark else 0, int(DSPARK_CONFIDENCE * 1e6) if self.dspark else 0,
+                len(__import__('tensorfold.cuda.exl3.linear', fromlist=['PLAN_TABLE']).PLAN_TABLE)] + \
             (self.copy.code() if self.copy is not None else [0] * len(CopySettings().code()))
         both = self._gather_ints(mine)
         if any(row != both[0] for row in both):
