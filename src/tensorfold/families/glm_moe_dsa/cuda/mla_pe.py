@@ -33,6 +33,13 @@ FUSED_LAUNCH = (4, 3)             # _sparse_rows_pe's warps and load stages
 DECODE_CH = int(os.environ.get("TF_GLM_DECODE_CH") or 512)
 if DECODE_CH % 32 or not 32 <= DECODE_CH <= 2048:
     raise ValueError(f"TF_GLM_DECODE_CH={DECODE_CH}: a multiple of 32 keys from 32 to 2,048")
+# TF_GLM_DECODE_LAUNCH "warps,stages": _sparse_chunks_pe's launch (default 4,3). One launch for every window (and the
+# concurrent rounds' rows.py), so a row keeps one arithmetic whatever its window. GB10 sweep 2026-10-16 (16 heads,
+# 2,048 selected keys of a 5-bit latent, us a layer at 1 / 4 / 8 / 15 rows): CH 256 + 4,3: 76 / 74 / 139 / 202;
+# CH 192 + 8,2: 42 / 44 / 81 / 161 (11 chunks: a 4-row window is 44 programs on 48 SMs); 16 warps: 3-10x slower
+DECODE_LAUNCH = tuple(int(v) for v in (os.environ.get("TF_GLM_DECODE_LAUNCH") or "4,3").split(","))
+if len(DECODE_LAUNCH) != 2 or DECODE_LAUNCH[0] not in (1, 2, 4, 8, 16) or not 1 <= DECODE_LAUNCH[1] <= 8:
+    raise ValueError(f"TF_GLM_DECODE_LAUNCH={DECODE_LAUNCH}: warps (1-16, a power of two),stages (1-8)")
 # _sparse_rows_pe's keys a tile on prompt chunks: 16 (GB10, 2,048 rows x 2,048 tokens over a 38k bf16 latent: 5.6 ms
 # against 7.9 at the decode windows' 32; other bits: the online softmax rescales every 16 keys) or KT (32: the decode
 # windows' bits) (TF_GLM_PROMPT_KT)
@@ -392,7 +399,8 @@ def sparse_attention(qa: torch.Tensor, qp: torch.Tensor, cache, pcache: torch.Te
     _sparse_chunks_pe[(R, triton.cdiv(H, hb), nch)](qa, qp, rows, scales, h32, pcache, tokens, counts, po, pm, pl,
                                                     R, W=W, H=H, LW=LW, PW=PW, CH=DECODE_CH, SCALE=scale, HBT=hb,
                                                     KTT=KT,
-                                                    KV8=kv8, QB=qb, num_warps=4, num_stages=3)
+                                                    KV8=kv8, QB=qb, num_warps=DECODE_LAUNCH[0],
+                                                    num_stages=DECODE_LAUNCH[1])
     _merge[(R, H)](po, pm, pl, out, counts, R, H=H, LW=LW, NCH=nch, SPARSE=True, num_warps=4)
 
 
