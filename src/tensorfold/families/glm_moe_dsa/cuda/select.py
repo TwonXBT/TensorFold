@@ -340,9 +340,106 @@ RADIX_ROWS = 16             # blocks of this many rows or more select with _radi
                             # 2,048-row chunk at 128k and ~10x for a decode row (check_select.py)
 
 
+# TF_GLM_SELECT_SPLIT=1: with a replicated cache, each of the world ranks scores only its range of the scored positions
+# (a quarter at TP4), keeps its own top index_topk (ties to the lower position), and the ranks all-gather those
+# candidates as (score, position) and every rank takes the same global top index_topk: the replicated selection exactly
+# (a global top-k member is in its range's top-k; a token's score is the same kernel's, bit for bit, whatever range
+# holds it). The scoring and the top-k passes over the scores shrink world-fold. ``stream``: the comm stream a prompt
+# micro-batch's collectives ride (forward.reduce's), so every rank issues its collectives in one order.
+SPLIT = os.environ.get("TF_GLM_SELECT_SPLIT", "0") == "1"
+
+
+def _scores_into(qi, wts, keys, R: int, pos_dev, scores: torch.Tensor, np_max: int, wide: bool, lo: int = 0) -> None:
+    """Scores [R, np_max] of positions lo .. lo + np_max - 1 (_select's kernels over a range view of the key plane, the
+    rows' positions shifted by lo: every score is the full-range kernel's, bit for bit)."""
+
+    from .kv8 import Kv8
+    from .kvq import KvQ
+
+    H = wts.shape[1]
+    D = qi.shape[1] // H
+    wscale = H ** -0.5
+    rb = 16 if R >= 16 else R
+    kv8, qb = isinstance(keys, Kv8), keys.bits if isinstance(keys, KvQ) else 0
+    ik, isc = (keys.codes, keys.scales) if kv8 or qb else (keys, keys)
+    hq = keys.h if qb else isc
+    ik = ik[lo:lo + np_max]
+    isc = isc[lo:lo + np_max] if (kv8 or qb) else ik
+    if not qb:
+        hq = isc
+    pos = pos_dev - lo if lo else pos_dev
+    HP = max(16, triton.next_power_of_2(H))
+    if SCORES_SPAN and wide:
+        _scores_span[(triton.cdiv(R, SPAN_RB), triton.cdiv(np_max, SPAN_TS))](
+            qi, wts, wts.stride(0), ik, isc, hq, scores, pos, R, np_max, D ** -0.5, wscale, H=H, HP=HP, D=D, BT=64,
+            RB=SPAN_RB, TS=SPAN_TS, KV8=kv8, QB=qb, num_warps=4)
+    else:
+        _scores[(triton.cdiv(R, rb), triton.cdiv(np_max, 64))](qi, wts, wts.stride(0), ik, isc, hq, scores, pos, R,
+                                                               np_max, D ** -0.5, wscale, H=H, HP=HP, D=D, BT=64,
+                                                               RB=rb, KV8=kv8, QB=qb, num_warps=4)
+
+
+def _select_split(qi, wts, keys, R: int, topk: int, pos_dev, tokens, counts, np_max: int, span, comm, rank: int,
+                  world: int, stream) -> None:
+    """_select with the scored positions split over the ranks (SPLIT): this rank's range [lo, lo + n), its top kl
+    candidates as (score, position) — the range's top-k by _select's own passes — all-gathered, and the global top k
+    by _order_key's rule (score, then the lower position) in ascending position order: the replicated tokens."""
+
+    dev = qi.device
+    wide = R >= RADIX_ROWS if span is None else span
+    seg = -(-np_max // (world * 64)) * 64
+    lo = min(rank * seg, np_max)
+    n = min(seg, np_max - lo)
+    k = min(topk, np_max)
+    kl = min(k, seg)
+    sc = torch.full((R, kl), float("-inf"), dtype=torch.float32, device=dev)
+    ps = torch.full((R, kl), 0x7FFFFFFF, dtype=torch.int32, device=dev)   # padding: loses every tie
+    if n > 0:
+        scores = torch.empty((R, n), dtype=torch.float32, device=dev)
+        _scores_into(qi, wts, keys, R, pos_dev, scores, n, wide, lo)
+        kk = min(kl, n)
+        tok = torch.zeros((R, kk), dtype=torch.int32, device=dev)
+        if wide:
+            _radix_topk[(R,)](scores, scores.stride(0), tok, tok.stride(0), n, K=kk, BLOCK=1024, num_warps=4)
+        else:
+            _split_topk(scores, tok, kk, n)
+        sc[:, :kk] = torch.gather(scores, 1, tok.to(torch.int64))
+        ps[:, :kk] = tok + lo
+        del scores
+    send = torch.cat([sc, ps.view(torch.float32)], dim=1).contiguous()
+    got = torch.empty((world * R * 2 * kl,), dtype=torch.float32, device=dev)
+    if stream is not None:
+        ready = torch.cuda.Event()
+        ready.record()
+        stream.wait_event(ready)
+        with torch.cuda.stream(stream):
+            comm.all_gather(send.view(-1), got)
+            done = torch.cuda.Event()
+            done.record()
+        torch.cuda.current_stream().wait_event(done)
+    else:
+        comm.all_gather(send.view(-1), got)
+    g = got.view(world, R, 2 * kl)
+    s_all = g[:, :, :kl].permute(1, 0, 2).reshape(R, world * kl)
+    p_all = g[:, :, kl:].contiguous().view(torch.int32).permute(1, 0, 2).reshape(R, world * kl)
+    bits = (s_all + 0.0).view(torch.int32)
+    key = torch.where(bits < 0, bits ^ 0x7FFFFFFF, bits).to(torch.int64).bitwise_left_shift_(32)
+    key.bitwise_or_(0xFFFFFFFF - p_all.to(torch.int64))
+    top = torch.topk(key, k, dim=1, sorted=False).indices
+    picked = torch.sort(torch.gather(p_all, 1, top), dim=1).values
+    width = tokens.shape[1]
+    tokens.zero_()
+    tokens[:, :k] = picked
+    if width > k:
+        tokens[:, k:] = -1
+    q = pos_dev.to(torch.int64) + torch.arange(R, device=dev)
+    counts.copy_(torch.where(q + 1 > topk, tokens.ne(-1).sum(1).clamp(max=width), torch.zeros_like(counts)))
+
+
 def select_tokens(qi: torch.Tensor, wts: torch.Tensor, keys, pos: int | None, R: int,
                   topk: int, pos_dev: torch.Tensor, *, tokens: torch.Tensor, counts: torch.Tensor,
-                  bucket: int | None = None, span: bool | None = None) -> None:
+                  bucket: int | None = None, span: bool | None = None, comm=None, rank: int = 0, world: int = 1,
+                  stream=None) -> None:
     """Each row's attended tokens [R, width] ascending (-1 padded) and their count past the dense limit.
 
     ``keys`` is the layer group's bf16 indexer key plane, its FP8 plane (kv8.Kv8) or its quantized one (kvq.KvQ).
@@ -367,22 +464,27 @@ def select_tokens(qi: torch.Tensor, wts: torch.Tensor, keys, pos: int | None, R:
     np_max = min(np_max, keys.shape[0])
     per_row = 4 * np_max if R >= RADIX_ROWS else 12 * np_max      # the radix path keeps only the fp32 scores
     rows = max(1, min(R, SELECT_BYTES // per_row))
+    split = (comm, rank, world, stream) if SPLIT and comm is not None and world > 1 else None
     if rows >= R:
-        _select(qi, wts, keys, R, topk, pos_dev, tokens, counts, np_max, span)
+        _select(qi, wts, keys, R, topk, pos_dev, tokens, counts, np_max, span, split)
         return
     for r0 in range(0, R, rows):
         r1 = min(R, r0 + rows)
         _select(qi[r0:r1], wts[r0:r1], keys, r1 - r0, topk, pos_dev + r0, tokens[r0:r1], counts[r0:r1], np_max,
-                span)
+                span, split)
 
 
 def _select(qi: torch.Tensor, wts: torch.Tensor, keys, R: int, topk: int, pos_dev: torch.Tensor,
-            tokens: torch.Tensor, counts: torch.Tensor, np_max: int, span: bool | None = None) -> None:
+            tokens: torch.Tensor, counts: torch.Tensor, np_max: int, span: bool | None = None, split=None) -> None:
     """select_tokens for rows at pos_dev .. pos_dev + R - 1 over np_max scored tokens (``span``: span scores and the
-    radix top-k whatever R, the chunk-invariant prompt path)."""
+    radix top-k whatever R, the chunk-invariant prompt path; ``split``: (comm, rank, world, stream), SPLIT)."""
 
     from .kv8 import Kv8
     from .kvq import KvQ
+
+    if split is not None:
+        _select_split(qi, wts, keys, R, topk, pos_dev, tokens, counts, np_max, span, *split)
+        return
 
     H = wts.shape[1]                                            # wts [R, heads]: each row's per-head weights
     D = qi.shape[1] // H

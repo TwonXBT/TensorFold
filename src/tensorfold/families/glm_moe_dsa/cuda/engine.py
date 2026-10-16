@@ -134,7 +134,8 @@ class GlmEngine:
                 DSPARK_DEPTH if self.dspark else 0, int(DSPARK_CONFIDENCE * 1e6) if self.dspark else 0,
                 len(__import__('tensorfold.cuda.exl3.linear', fromlist=['PLAN_TABLE']).PLAN_TABLE), MAX_ROWS,
                 sum(r << (4 * i) for i, r in enumerate(WIDE_GRAPHS)),
-                __import__('tensorfold.families.glm_moe_dsa.cuda.mla_pe', fromlist=['DECODE_CH']).DECODE_CH] + \
+                __import__('tensorfold.families.glm_moe_dsa.cuda.mla_pe', fromlist=['DECODE_CH']).DECODE_CH,
+                int(__import__('tensorfold.families.glm_moe_dsa.cuda.select', fromlist=['SPLIT']).SPLIT)] + \
             (self.copy.code() if self.copy is not None else [0] * len(CopySettings().code()))
         both = self._gather_ints(mine)
         if any(row != both[0] for row in both):
