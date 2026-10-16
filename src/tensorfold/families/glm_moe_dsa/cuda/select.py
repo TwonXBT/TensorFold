@@ -347,6 +347,12 @@ RADIX_ROWS = 16             # blocks of this many rows or more select with _radi
 # holds it). The scoring and the top-k passes over the scores shrink world-fold. ``stream``: the comm stream a prompt
 # micro-batch's collectives ride (forward.reduce's), so every rank issues its collectives in one order.
 SPLIT = os.environ.get("TF_GLM_SELECT_SPLIT", "0") == "1"
+# decode windows (fewer than RADIX_ROWS rows) take the split path only from TF_GLM_SELECT_SPLIT_DECODE row x position
+# products (R x scored positions; default 600,000): the split path's fixed cost (the merge, the all-gather) beats its
+# quarter-size scoring only at long contexts and wide windows. GB10, 21 layers' selections, replicated vs split: 12K 1-8
+# rows 3.3-3.9 vs 5.8-6.3 ms; 104K 1/4/8 rows 4.0/6.1/8.8 vs 6.4/7.0/7.9; 200K 5.2/9.4/15.1 vs 6.5/7.6/9.1 (+ the
+# network). Both paths select the same tokens (prompt rows always split); 0: every decode window splits
+SPLIT_DECODE = int(os.environ.get("TF_GLM_SELECT_SPLIT_DECODE") or 600_000)
 
 
 def _scores_into(qi, wts, keys, R: int, pos_dev, scores: torch.Tensor, np_max: int, wide: bool, lo: int = 0) -> None:
@@ -474,7 +480,8 @@ def select_tokens(qi: torch.Tensor, wts: torch.Tensor, keys, pos: int | None, R:
     np_max = min(np_max, keys.shape[0])
     per_row = 4 * np_max if R >= RADIX_ROWS else 12 * np_max      # the radix path keeps only the fp32 scores
     rows = max(1, min(R, SELECT_BYTES // per_row))
-    split = (comm, rank, world, stream) if SPLIT and comm is not None and world > 1 else None
+    split = (comm, rank, world, stream) if SPLIT and comm is not None and world > 1 and (
+        R >= RADIX_ROWS or span or R * np_max >= SPLIT_DECODE) else None
     if rows >= R:
         _select(qi, wts, keys, R, topk, pos_dev, tokens, counts, np_max, span, split)
         return
