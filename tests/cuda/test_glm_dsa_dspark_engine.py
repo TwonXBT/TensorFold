@@ -624,3 +624,34 @@ def test_conversations_swap_back_and_forth(tmp_path, monkeypatch):
     assert e.cached == 0
     want = serial_decode(e, want_first, 20, None).tokens
     assert (got_first, got) == (want_first, want)
+
+
+def test_merged_prompt_moe_keeps_every_rows_bits(tmp_path, monkeypatch):
+    """TF_GLM_PROMPT_MOE_MERGE: at world 4 a 256-row chunk takes the micro-batch path; running the MoE halves' routed
+    experts once over both micro-batches changes no bit of the chunk's logits, its last hidden row or its cache rows."""
+
+    from tensorfold.families.glm_moe_dsa.cuda import convcache, forward as fwd
+    from tensorfold.families.glm_moe_dsa.cuda.decode import prefill
+
+    eng = _engine(tmp_path / "merge", monkeypatch, 4, drafter=False)
+    e = eng.e
+    tokens = list(range(1, PROMPT + 1))
+    taken = {"merged": 0}
+    plain = fwd.ffn_merged
+
+    def spy(*a, **k):
+        taken["merged"] += 1
+        return plain(*a, **k)
+
+    monkeypatch.setattr(fwd, "ffn_merged", spy)
+    out = {}
+    for merge in (False, True):
+        monkeypatch.setattr(fwd, "MOE_MERGE", merge)
+        e.kept = None
+        first = prefill(e, tokens, None)
+        out[merge] = (first, e.last_hidden.clone(), [t[:PROMPT].clone() for t in convcache.planes(e.st)])
+    assert taken["merged"] > 0
+    a, b = out[False], out[True]
+    assert a[0] == b[0]
+    assert torch.equal(a[1], b[1])
+    assert all(torch.equal(x, y) for x, y in zip(a[2], b[2]))
