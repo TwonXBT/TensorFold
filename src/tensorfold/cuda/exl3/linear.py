@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
+import os
 import torch
 
 from . import format as fmt
@@ -27,9 +28,20 @@ def k2_of(bits: float) -> int:
     return int(2 * fmt.check_bits(bits))
 
 
+# TF_GLM_X3_PLAN=gb10: measured (K splits, warps) for GLM-5.3's TP4 body shapes on GB10 (48 SMs, 2,200 MHz cap), by a
+# random-trellis sweep over every valid plan at 1, 4 and 8 rows (2026-10-16): 8 warps where the K range allows them;
+# o_proj 77.7 -> 73.3 us, the shared experts' gate/up 17.6/23.6 -> 15.3 us, 1.4 ms a token over the 78 layers. Still the
+# shape's alone (every row count keeps one reduction); other bits than plan()'s, the same bits on every path.
+PLAN_TABLES = {"gb10": {(3072, 6144): (2, 8), (6144, 3072): (8, 8), (512, 6144): (1, 8), (6144, 512): (8, 8),
+                        (6144, 640): (8, 8), (4096, 6144): (1, 8)}}
+PLAN_TABLE = PLAN_TABLES.get(os.environ.get("TF_GLM_X3_PLAN", ""), {})
+
+
 def plan(k: int, n: int, blocks: int = 192, min_tiles: int = 8) -> tuple[int, int]:
     """(K splits, warps a program) for a K x N layer: the shape's alone, so a layer keeps one reduction for every row count."""
 
+    if (k, n) in PLAN_TABLE:
+        return PLAN_TABLE[(k, n)]
     kt, nb = k // 16, n // 128
     sk, wk = (1, 8) if nb >= 64 else (1, 4)
     if nb < 64:                                   # a narrow layer needs K splits to fill the SMs at all
