@@ -389,11 +389,15 @@ def test_dspark_replies_equal_the_serial_reply(tmp_path, monkeypatch, sampled):
     first = prefill(e, prompt, sampling, drafter=d)
     want = serial_decode(e, first, n, sampling).tokens
 
-    for copy in (False, True):
+    for copy in (False, True, "hybrid"):
         e.kept = None
         first2 = prefill(e, prompt, sampling, drafter=d)
         assert first2 == first
-        copies = CopySettings.from_env(7, env={"TF_GLM_COPY_DRAFTS": "1"}).drafts(list(prompt) + [first2], hybrid=False) if copy else None
+        env = {"TF_GLM_COPY_DRAFTS": "1", **({"TF_GLM_COPY_HYBRID": "1"} if copy == "hybrid" else {})}
+        copies = (CopySettings.from_env(7, env=env).drafts(list(prompt) + [first2], hybrid=copy == "hybrid")
+                  if copy else None)
+        if copy == "hybrid":
+            assert copies.hybrid is not None
         res = dflash_decode(e, d, first2, n, sampling, policy=DepthPolicy(7, fixed=True), copies=copies)
         assert res.tokens == want, (copy, res.tokens, want)
         assert d.context_end == e.st.pos                   # every kept row reached the drafter

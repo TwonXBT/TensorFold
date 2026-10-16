@@ -367,7 +367,8 @@ class GlmEngine:
             policy = DepthPolicy(depth, fixed=True, confidence=confidence)
         copies = None
         if policy is not None and (self.w.mtp is not None or dspark) and draft and self.copy is not None:
-            copies = self.copy.drafts(list(prompt) + [first], hybrid=False)   # prompt and pending token, alike on every rank
+            # prompt and pending token, alike on every rank; TF_GLM_COPY_HYBRID applies with a DSpark drafter
+            copies = self.copy.drafts(list(prompt) + [first], hybrid=dspark)
         if dspark:
             res = dflash_decode(self.e, self.drafter, first, max_tokens, sampling, policy=policy, stop_eos=stop_eos,
                                 on_tokens=on_tokens, copies=copies)
@@ -380,6 +381,9 @@ class GlmEngine:
                      sha256=__import__("hashlib").sha256(json.dumps(res.tokens).encode()).hexdigest()[:16])
         if self.w.comm is None or self.w.rank == 0:
             copy_note = f" copy {res.copy_rounds}/{res.copy_accepted} kept" if getattr(res, "copy_rounds", 0) else ""
+            kinds = getattr(res, "kinds", "")
+            if kinds:
+                copy_note += " kinds " + " ".join(f"{k}{kinds.count(k)}" for k in "scxhtd" if k in kinds)
             print(f"[tensorfold] decode {len(res.tokens)} tok {res.tokens_per_second:.2f} tok/s rounds {res.rounds}"
                   f" drafted {res.drafted} accepted {res.accepted}{copy_note}"
                   + (f" dspark d{policy.most} c{policy.confidence:g} ms/round draft "

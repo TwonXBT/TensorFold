@@ -320,13 +320,21 @@ def dflash_decode(e: "Engine", drafter, pending: int, count: int, sampling, *, p
     torch.cuda.synchronize()
     start = time.perf_counter()
     depth = min(policy.next(0, 0), count - len(out))
+    hybrid = getattr(copies, "hybrid", None) if copies is not None else None
+    kinds: list[str] = []
     while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
         t0 = time.perf_counter()
-        copied = copies.propose(copy_room(copies, count, out)) if copies is not None else []
-        if copied:
-            drafts = copied
+        if hybrid is not None:              # TF_GLM_COPY_HYBRID: copies vetted by the drafter's block
+            drafts, kind = hybrid_round(drafter, copies, hybrid, out[-1], depth, copy_room(copies, count, out),
+                                        sampling, policy)
+            copied = kind != "d"
+            kinds.append(kind)
         else:
-            drafts = drafter.propose(out[-1], depth, sampling, policy.confidence) if depth > 0 else []
+            copied = copies.propose(copy_room(copies, count, out)) if copies is not None else []
+            if copied:
+                drafts = copied
+            else:
+                drafts = drafter.propose(out[-1], depth, sampling, policy.confidence) if depth > 0 else []
         t1 = time.perf_counter()
         tokens = e.verify_window([out[-1]] + list(drafts))
         drafts = tokens[1:]
@@ -367,7 +375,33 @@ def dflash_decode(e: "Engine", drafter, pending: int, count: int, sampling, *, p
     torch.cuda.synchronize()
     res = DecodeResult(out[:count], time.perf_counter() - start, rounds, drafted, accepted, stages, depths, keeps)
     res.copy_rounds, res.copy_drafted, res.copy_accepted = c_rounds, c_drafted, c_accepted
+    res.kinds = "".join(kinds)
     return res
+
+
+def hybrid_round(drafter, copies, h, pending: int, depth: int, room: int, sampling, policy) -> tuple[list[int], str]:
+    """A round's drafts under TF_GLM_COPY_HYBRID (``copy_drafts.CopyDrafts.plan`` and ``hybrid``) and its kind: "s" /
+    "c" (a trusted copy, no block), "x" / "h" (a copy DSpark's block agreed with, extended / then its chain), "t" (a
+    trusted copy among others none of which the block agreed with throughout), "d" (DSpark's chain). Host arithmetic
+    on what every rank holds alike: the same drafts on every rank. (Mia-AiLab's ``hybrid_round``, Apache-2.0.)"""
+
+    plan = copies.plan(h, room, drafter.block)
+    if plan.drafts:
+        copies.follow(plan.start, plan.copied)
+        return copies.padded(plan.drafts, room), plan.kind
+    if depth < 1:
+        return [], "d"
+    if not plan.conts:
+        return drafter.propose(pending, depth, sampling, policy.confidence), "d"
+    drafts, kind, k = drafter.propose_hybrid(pending, [c for _, c in plan.conts], depth, sampling, policy.confidence,
+                                             rank=h.rank, most=min(copies.most, room))
+    if kind != "x" and plan.trusted >= 0:      # no continuation agreed throughout: the trusted one, as "c" would
+        k, kind = plan.trusted, "t"
+        drafts = plan.conts[k][1][:min(copies.most, room)]
+    if kind in ("x", "t"):
+        copies.follow(plan.conts[k][0], len(drafts))
+        drafts = copies.padded(drafts, room)
+    return drafts, kind
 
 
 class Engine:
