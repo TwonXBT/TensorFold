@@ -9,7 +9,16 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-MAX_ROWS = 8                          # the widest verify window (a pending token and up to 7 drafts)
+# the widest verify window (a pending token and up to MAX_ROWS - 1 drafts). TF_GLM_MAX_ROWS (8-15, default 8) widens
+# it for copy drafts, whose windows past 8 rows pad up to a TF_GLM_WIDE_GRAPHS width (e.g. "12,15") so they replay a
+# CUDA graph. 15 at most: at 16 rows the indexer scores with the span kernel (select.RADIX_ROWS: other bits), so a
+# 16-row window's selection could part from the serial step's.
+MAX_ROWS = int(os.environ.get("TF_GLM_MAX_ROWS") or 8)
+if not 8 <= MAX_ROWS <= 15:
+    raise ValueError(f"TF_GLM_MAX_ROWS={MAX_ROWS}: 8 to 15 rows")
+WIDE_GRAPHS = tuple(sorted({int(x) for x in (os.environ.get("TF_GLM_WIDE_GRAPHS") or "").split(",") if x.strip()}))
+if any(not 8 < r <= MAX_ROWS for r in WIDE_GRAPHS):
+    raise ValueError(f"TF_GLM_WIDE_GRAPHS={WIDE_GRAPHS}: widths past 8 rows up to TF_GLM_MAX_ROWS={MAX_ROWS}")
 # a prompt chunk's rows (TF_GLM_PREFILL_ROWS): 8,192 runs each micro-batch's experts on 4,096 rows, twice the rows a
 # weight read of 2,048-row chunks (32.5k-token prefill on TP4: 32.0 s against 35.9 at 4,096 and ~40 at 2,048)
 PROMPT_ROWS = int(os.environ.get("TF_GLM_PREFILL_ROWS") or 8192)
@@ -20,7 +29,7 @@ GRAPH_ROWS = (1, 2, 3, 4, 5, 6)       # verify windows captured as CUDA graphs
 # a DSpark drafter (--drafter): drafts a round (TF_GLM_DSPARK_DEPTH, at most MAX_ROWS - 1 = 7, its block of 8 less the
 # pending token) and the confidence-product cut of its chain (TF_GLM_DSPARK_CONFIDENCE; 0: always the full depth);
 # both change proposals, so the ranks' settings comparison carries them
-DSPARK_DEPTH = min(int(os.environ.get("TF_GLM_DSPARK_DEPTH") or MAX_ROWS - 1), MAX_ROWS - 1)
+DSPARK_DEPTH = min(int(os.environ.get("TF_GLM_DSPARK_DEPTH") or 7), 7, MAX_ROWS - 1)     # its block of 8
 DSPARK_CONFIDENCE = float(os.environ.get("TF_GLM_DSPARK_CONFIDENCE") or 0.0)
 DENSE_CAPACITY = 2560                 # cache slots while DSA attention stays dense (contexts up to 2,048 tokens)
 DEFAULT_POLICY = "auto"
@@ -112,7 +121,9 @@ class GlmEngine:
         # the MTP head; every rank must agree, so the settings join the startup comparison below
         from .copy_drafts import CopySettings
 
-        self.copy = None if serial_only else CopySettings.from_env(MAX_ROWS - 1)
+        # copy drafts up to MAX_ROWS - 1 a round; with DSpark, windows past 8 rows pad up to a wide graph's width
+        self.copy = None if serial_only else CopySettings.from_env(MAX_ROWS - 1,
+                                                                   pad=WIDE_GRAPHS if self.dspark else ())
         if drafter is not None and not self.dspark:
             raise ValueError(f"{drafter}: --drafter wants a DSpark speculator (speculators_model_type=dspark); "
                              "this family has no DFlash2 draft model")
@@ -121,7 +132,8 @@ class GlmEngine:
                 streams, FILL_ROWS if streams > 1 else 0, QUICK_ROWS if streams > 1 else 0, int(DEPTH_COST * 1e6),
                 int(KEEP), int(EXTENTS), int(DRAFT_CUT * 1e6), CUT_STREAMS,
                 DSPARK_DEPTH if self.dspark else 0, int(DSPARK_CONFIDENCE * 1e6) if self.dspark else 0,
-                len(__import__('tensorfold.cuda.exl3.linear', fromlist=['PLAN_TABLE']).PLAN_TABLE),
+                len(__import__('tensorfold.cuda.exl3.linear', fromlist=['PLAN_TABLE']).PLAN_TABLE), MAX_ROWS,
+                sum(r << (4 * i) for i, r in enumerate(WIDE_GRAPHS)),
                 __import__('tensorfold.families.glm_moe_dsa.cuda.mla_pe', fromlist=['DECODE_CH']).DECODE_CH] + \
             (self.copy.code() if self.copy is not None else [0] * len(CopySettings().code()))
         both = self._gather_ints(mine)
@@ -187,7 +199,7 @@ class GlmEngine:
                 self.drafter = Drafter(drafter, w, capacity=capacity, tap_rows=MAX_ROWS, ring=True)
             # a DSpark round verifies up to MAX_ROWS rows: every window width gets its graph
             self.e = Decoder(w, capacity=capacity, max_rows=MAX_ROWS, prefill_rows=prefill_rows, graphs=True,
-                             graph_rows=tuple(range(1, MAX_ROWS + 1)) if self.dspark else GRAPH_ROWS,
+                             graph_rows=tuple(range(1, 9)) + WIDE_GRAPHS if self.dspark else GRAPH_ROWS,
                              long_context=long_context,
                              taps=self.drafter.tap_layers if self.drafter is not None else ())
             if self.drafter is not None:

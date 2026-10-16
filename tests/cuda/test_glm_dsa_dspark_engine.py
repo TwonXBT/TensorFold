@@ -284,7 +284,10 @@ def test_a_prompt_chunks_tap_rows_equal_the_decode_paths(tmp_path, monkeypatch, 
         # the fast prompt kernels and the decode kernels reduce in different orders: bf16 ulps (one row of
         # the 300), not a placement fault — a wrong tap point reads a different layer's stream, orders away.
         # equal_nan: the fake's random weights overflow bf16 at depth, identically on both sides.
-        close = torch.allclose(prompt.float(), decode.float(), atol=1e-3, rtol=2e-2, equal_nan=True)
+        # rounding-order noise flips a handful of values past the tolerance on some runs (3 of 76,800 seen): allow
+        # 0.01% of them; a wrong tap point would put whole rows off
+        far_n = int((~torch.isclose(prompt.float(), decode.float(), atol=1e-3, rtol=2e-2, equal_nan=True)).sum())
+        close = far_n <= max(4, prompt.numel() // 10000)
         if not close:
             bad = (~torch.isclose(prompt.float(), decode.float(), atol=1e-3, rtol=2e-2, equal_nan=True)) \
                 .any(dim=1).nonzero().flatten()
@@ -449,3 +452,30 @@ def test_a_long_prompt_then_an_unrelated_short_one_keeps_the_drafter_aligned(tmp
     assert d.context_end == e.st.pos == len(short)
     res = dflash_decode(e, d, first, 12, None, policy=DepthPolicy(7, fixed=True))
     assert d.context_end == e.st.pos and len(res.tokens) == 12
+
+
+def test_wide_copy_windows_keep_the_serial_reply(tmp_path, monkeypatch):
+    """TF_GLM_MAX_ROWS=15 with wide graphs (12, 15): copy drafts up to 14 a round, windows padded to a captured width,
+    replies equal to the serial reply (greedy), the drafter aligned throughout."""
+
+    from tensorfold.families.glm5_next.cuda.decode import DepthPolicy
+    from tensorfold.families.glm_moe_dsa.cuda import engine as engine_mod
+    from tensorfold.families.glm_moe_dsa.cuda.copy_drafts import CopySettings
+    from tensorfold.families.glm_moe_dsa.cuda.decode import dflash_decode, prefill, serial_decode
+
+    monkeypatch.setattr(engine_mod, "MAX_ROWS", 15)
+    monkeypatch.setattr(engine_mod, "WIDE_GRAPHS", (12, 15))
+    eng = _engine(tmp_path / "wide", monkeypatch, 1, drafter=True)
+    e, d = eng.e, eng.drafter
+    assert e.buf.x.shape[0] >= 15 and (15, 0) in e.graphs.main and (12, 0) in e.graphs.main
+    prompt = [3, 9, 27, 81, 5, 25, 7, 49] * 14
+    first = prefill(e, prompt, None, drafter=d)
+    want = serial_decode(e, first, 48, None).tokens
+    e.kept = None
+    first2 = prefill(e, prompt, None, drafter=d)
+    env = {"TF_GLM_COPY_DRAFTS": "1", "TF_GLM_COPY_MAX": "14"}
+    copies = CopySettings.from_env(14, env=env, pad=(12, 15)).drafts(list(prompt) + [first2], hybrid=False)
+    res = dflash_decode(e, d, first2, 48, None, policy=DepthPolicy(7, fixed=True), copies=copies)
+    assert res.tokens == want
+    assert d.context_end == e.st.pos
+    assert max(res.depths) <= 14
