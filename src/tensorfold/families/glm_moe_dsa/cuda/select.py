@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from functools import lru_cache
 
 import torch
 import triton
@@ -290,6 +291,32 @@ def _split_write(S, s_stride, STATE, COUNTS, TOK, t_stride, NP, NSEG, SEG: tl.co
 
 
 SPLIT_SEG = 16384           # scores a program of the decode-row selection reads
+# topk_rows.cu: one launch a selection (a block a row, radix select with 11-bit digits, the candidates of the K-th key's
+# bin finished in shared memory), the set and order of _split_topk's launches and of torch.topk + sort on _order_key.
+# Decode windows up to TF_GLM_TOPK_ROWS_NP scored positions (default 131,072; 0: never) and the split selection's
+# merges take it: 21 selections at 12K went from 2.75 to 0.24 ms, at 64K from 2.8 to 0.85 (GB10); past 128K the
+# per-row block falls behind the segmented launches. Prompt rows too (TF_GLM_TOPK_PROMPT=0: _radix_topk as before):
+# 512 rows x 26K 0.99 -> 0.33 ms, x 104K 4.78 -> 1.32 ms, the same tokens
+TOPK_NP = int(os.environ.get("TF_GLM_TOPK_ROWS_NP") or 131072)
+TOPK_PROMPT = os.environ.get("TF_GLM_TOPK_PROMPT", "1") != "0"
+
+
+@lru_cache(maxsize=1)
+def _topk_ext():
+    from pathlib import Path
+
+    from tensorfold.cuda.build import load
+
+    return load(name="tensorfold_glm_topk_rows_v1", sources=[str(Path(__file__).parent / "topk_rows.cu")],
+                extra_cuda_cflags=["-O3"], verbose=False)
+
+
+def topk_rows(scores: torch.Tensor, tokens: torch.Tensor, k: int, np_max: int, *, counts: torch.Tensor | None = None,
+              pos_dev: torch.Tensor | None = None, topk: int = 0, pmap: torch.Tensor | None = None) -> None:
+    """tokens[r, :k] = the k highest of scores[r, :np_max] (ties to the lower index) ascending, as indices or as
+    pmap[r, index]; tokens[r, k:] = -1; counts[r] = k when pos_dev[0] + r + 1 > topk else 0 (when given)."""
+
+    _topk_ext().topk_rows(scores, tokens, int(k), int(np_max), pmap, counts, pos_dev, int(topk))
 
 
 def _split_topk(scores: torch.Tensor, tokens: torch.Tensor, k: int, np_max: int) -> None:
@@ -405,8 +432,10 @@ def _select_split(qi, wts, keys, R: int, topk: int, pos_dev, tokens, counts, np_
         _scores_into(qi, wts, keys, R, pos_dev, scores, n, wide, lo)
         kk = min(kl, n)
         tok = torch.zeros((R, kk), dtype=torch.int32, device=dev)
-        if wide:
+        if wide and not TOPK_PROMPT:
             _radix_topk[(R,)](scores, scores.stride(0), tok, tok.stride(0), n, K=kk, BLOCK=1024, num_warps=4)
+        elif wide or 0 < n <= TOPK_NP:
+            topk_rows(scores, tok, kk, n)
         else:
             _split_topk(scores, tok, kk, n)
         sc[:, :kk] = torch.gather(scores, 1, tok.to(torch.int64))
@@ -428,28 +457,14 @@ def _select_split(qi, wts, keys, R: int, topk: int, pos_dev, tokens, counts, np_
     g = got.view(world, R, 2 * kl)
     s_all = g[:, :, :kl].permute(1, 0, 2).reshape(R, world * kl)
     p_all = g[:, :, kl:].contiguous().view(torch.int32).permute(1, 0, 2).reshape(R, world * kl)
-    if wide:
-        # prompt rows: _radix_topk over the candidates (a program a row). The rank blocks are in position order and
-        # each block ascending, so among finite scores a lower index is a lower position (_radix_topk's tie rule is the
-        # one below) and the picked indices come out ascending; padding (-inf, past every position) is never picked
-        # (a row with count > 0 has at least k finite candidates). torch.topk over int64 keys plus a sort was ~3 s of
-        # a 26k-token prefill (mbtopk passes and their elementwise ops)
-        idx = torch.zeros((R, k), dtype=torch.int32, device=dev)
-        _radix_topk[(R,)](s_all, s_all.stride(0), idx, idx.stride(0), world * kl, K=k, BLOCK=1024, num_warps=4)
-        picked = torch.gather(p_all, 1, idx.to(torch.int64))
-    else:
-        bits = (s_all + 0.0).view(torch.int32)
-        key = torch.where(bits < 0, bits ^ 0x7FFFFFFF, bits).to(torch.int64).bitwise_left_shift_(32)
-        key.bitwise_or_(0xFFFFFFFF - p_all.to(torch.int64))
-        top = torch.topk(key, k, dim=1, sorted=False).indices
-        picked = torch.sort(torch.gather(p_all, 1, top), dim=1).values
-    width = tokens.shape[1]
-    tokens.zero_()
-    tokens[:, :k] = picked
-    if width > k:
-        tokens[:, k:] = -1
-    q = pos_dev.to(torch.int64) + torch.arange(R, device=dev)
-    counts.copy_(torch.where(q + 1 > topk, tokens.ne(-1).sum(1).clamp(max=width), torch.zeros_like(counts)))
+    # the global top k over the candidates, one launch (topk_rows: ties to the lower index). The rank blocks are in
+    # position order and each block ascending, so among finite scores a lower index is a lower position (the
+    # reference tie rule) and the picked positions come out ascending; padding (-inf, past every position) is never
+    # picked (a row with count > 0 has at least k finite candidates). (torch.topk over int64 keys plus a sort was
+    # ~3 s of a 26k-token prefill, and ~1.3 ms a decode forward at 21 selections.)
+    if tokens.stride(1) != 1:
+        raise ValueError("select_tokens: tokens must have unit column stride")
+    topk_rows(s_all, tokens, k, world * kl, counts=counts, pos_dev=pos_dev, topk=topk, pmap=p_all)
 
 
 def select_tokens(qi: torch.Tensor, wts: torch.Tensor, keys, pos: int | None, R: int,
@@ -523,6 +538,11 @@ def _select(qi: torch.Tensor, wts: torch.Tensor, keys, R: int, topk: int, pos_de
                                                                RB=rb, KV8=kv8, QB=qb, num_warps=4)
     width = tokens.shape[1]
     k = min(topk, np_max)
+    if tokens.stride(1) == 1 and ((wide and TOPK_PROMPT) or (not wide and 0 < np_max <= TOPK_NP)):
+        # one launch: the tokens, the -1 padding and the counts
+        topk_rows(scores, tokens, k, np_max, counts=counts, pos_dev=pos_dev, topk=topk)
+        del scores
+        return
     if wide and tokens.stride(1) == 1:
         tokens.zero_()
         _radix_topk[(R,)](scores, scores.stride(0), tokens, tokens.stride(0), np_max, K=k, BLOCK=1024, num_warps=4)
