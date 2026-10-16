@@ -697,17 +697,18 @@ class Drafter(_DFlash2):
         """Roll the context back to position ``cut`` for a kept prompt's resume (TF_GLM_KEEP_SLOTS; decode.prefill):
         the rows before ``cut`` were fed from the same tokens, so the drafter keeps them. Exact while the ring still
         holds the window before ``cut``: every row written past it (the last reply, the chunk slack) must not have
-        wrapped onto a slot that window reads (end - cut <= ring - span - block). Otherwise — or for cut 0, or a cut
-        past the context — the context resets and drafts start shallow (replies are unchanged: drafts only
-        propose). True when the context was kept."""
+        wrapped onto a slot that window reads (end - cut <= ring - span - block). Otherwise — a cut past the context,
+        or rows past it that wrapped — the position still moves to ``cut`` (the target resumes there, and every
+        later row must land at its own position), over a context that is stale before it: drafts start shallow
+        until the window refills (replies are unchanged: drafts only propose). True when the context was kept.
+        (2026-10-16: resetting to 0 here left the drafter ``cut`` rows behind the target after a long prompt was
+        followed by an unrelated short one; dflash_decode refused the request.)"""
 
         end = self.context_end
-        if 0 < cut <= end and (not self.ring or end - cut <= self.ring - self.span - self.block):
-            self.context_end = cut
-            self.pos_dev.fill_(cut)
-            return True
-        self.reset()
-        return False
+        kept = 0 < cut <= end and (not self.ring or end - cut <= self.ring - self.span - self.block)
+        self.context_end = max(0, int(cut))
+        self.pos_dev.fill_(self.context_end)
+        return kept
 
 
 # -- the engine's wiring -------------------------------------------------------------------------------------------
