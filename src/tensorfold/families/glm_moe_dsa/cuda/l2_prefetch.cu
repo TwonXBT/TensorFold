@@ -44,7 +44,7 @@ void prefetch(const at::Tensor& table, int64_t n, int64_t blocks) {
                 "l2 prefetch: table int64 [n, 2] on the device");
     c10::cuda::CUDAGuard guard(table.device());
     prefetch_kernel<<<(unsigned)std::max<int64_t>(1, blocks), THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
-        table.data_ptr<int64_t>(), (int)n);
+        reinterpret_cast<const long long*>(table.data_ptr<int64_t>()), (int)n);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
