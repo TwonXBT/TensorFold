@@ -106,9 +106,12 @@ class DSparkConfig:
 
     @classmethod
     def read(cls, draft_dir: str | Path) -> "DSparkConfig":
-        cfg = json.loads((Path(draft_dir) / "config.json").read_text())
+        return cls.from_dict(json.loads((Path(draft_dir) / "config.json").read_text()), draft_dir)
+
+    @classmethod
+    def from_dict(cls, cfg: dict, what: str | Path = "the config") -> "DSparkConfig":
         if cfg.get("speculators_model_type", "dspark") != "dspark":
-            raise ValueError(f"{draft_dir}: not a DSpark speculator ({cfg.get('speculators_model_type')})")
+            raise ValueError(f"{what}: not a DSpark speculator ({cfg.get('speculators_model_type')})")
         t = cfg["transformer_layer_config"]
         heads = int(t["num_attention_heads"])
         hd = int(t.get("head_dim") or int(t["hidden_size"]) // heads)
@@ -186,12 +189,21 @@ def shares(c: DSparkConfig, rank: int, world: int) -> dict[str, tuple[int, int]]
             "mlp": (unit * share_lo(c.inter // unit, world, rank), mlps[rank])}
 
 
+def resume_rows() -> int:
+    """TF_GLM_DSPARK_RESUME_ROWS (default 4,096): spare context-ring rows past the window, so a kept prompt's resume
+    (TF_GLM_KEEP_SLOTS) rolls the drafter back instead of resetting it — exact while the rows written past the resume
+    point (the last reply and the chunk-boundary slack) fit in the spare (``Drafter.resume``). About 24 KB a row a rank
+    for GLM-5.3's drafter (3 layers, 16 KV heads a rank, head 128): 4,096 rows ~ 100 MB a rank."""
+
+    return max(0, int(os.environ.get("TF_GLM_DSPARK_RESUME_ROWS", "") or 4096))
+
+
 def ring_rows(c: DSparkConfig) -> int:
-    """Rows of the context ring: the window, the block and a tile (``geometry.draft_ring_rows``)."""
+    """Rows of the context ring: the window, the resume spare, the block and a tile (``geometry.draft_ring_rows``)."""
 
     from tensorfold.cuda.geometry import draft_ring_rows
 
-    return draft_ring_rows(c.window - 1, c.block) if c.window > 0 else 0
+    return draft_ring_rows(c.window - 1 + resume_rows(), c.block) if c.window > 0 else 0
 
 
 def memory(c: DSparkConfig, rank: int, world: int, *, quant: str = "q4", capacity: int = 2560,
@@ -680,3 +692,65 @@ class Drafter(_DFlash2):
         tokens, values, hconf = self.candidates(pending, depth)
         return self.chain(tokens, values, hconf, pending, self.context_end + 1, sampling, confidence,
                           round_ms=round_ms)
+
+    def resume(self, cut: int) -> bool:
+        """Roll the context back to position ``cut`` for a kept prompt's resume (TF_GLM_KEEP_SLOTS; decode.prefill):
+        the rows before ``cut`` were fed from the same tokens, so the drafter keeps them. Exact while the ring still
+        holds the window before ``cut``: every row written past it (the last reply, the chunk slack) must not have
+        wrapped onto a slot that window reads (end - cut <= ring - span - block). Otherwise — or for cut 0, or a cut
+        past the context — the context resets and drafts start shallow (replies are unchanged: drafts only
+        propose). True when the context was kept."""
+
+        end = self.context_end
+        if 0 < cut <= end and (not self.ring or end - cut <= self.ring - self.span - self.block):
+            self.context_end = cut
+            self.pos_dev.fill_(cut)
+            return True
+        self.reset()
+        return False
+
+
+# -- the engine's wiring -------------------------------------------------------------------------------------------
+def is_dspark(draft_dir: str | Path) -> bool:
+    """Whether ``draft_dir`` holds a DSpark speculator (``speculators_model_type``), for the engine's --drafter path."""
+
+    try:
+        cfg = json.loads((Path(draft_dir) / "config.json").read_text())
+    except (OSError, ValueError):
+        return False
+    return cfg.get("speculators_model_type", "dspark") == "dspark"
+
+
+def dspark_weights(draft_dir, world: int) -> "Weights":
+    """The DSpark drafter as held on each rank (its q4 matrices, bf16 norms, K/V context and fixed buffers, and the
+    host Markov tables), and its staging: the widest rank's shares (rank 0's: the n % world ranks hold one more
+    unit), the peak one matrix's bf16 slice reaches while the loader quantizes it."""
+
+    from tensorfold.cuda.capacity import Weights
+
+    c = DSparkConfig.read(draft_dir)
+    m = memory(c, 0, world, capacity=0, ring=True)
+    s = shares(c, 0, world)
+    D, hd = c.hidden, c.head_dim
+    q, kv, ml = s["q"][1] * hd, s["kv"][1] * hd, s["mlp"][1]
+    staging = max((q + 2 * kv) * D, D * q, 2 * ml * D, D * ml, D * len(c.aux_ids) * D) * 2
+    return Weights(m["device"] + m["host"], max(staging, m["device"]), 0)
+
+
+def dspark_geometry(t: dict, world: int, reserve: int, *, ring: bool = True) -> "Geometry":
+    """The DSpark drafter's per-slot bytes beside the target's: its K/V context rows (a ring, or capacity + block)
+    and the fixed buffers; the weights are counted once by ``dspark_weights``. ``t``: the speculator's config dict."""
+
+    from tensorfold.cuda.geometry import Geometry
+
+    c = DSparkConfig.from_dict(t)
+    rows = ring_rows(c) if ring and c.window > 0 else 0
+
+    def bytes_at(capacity: int) -> int:
+        s = shares(c, 0, world)
+        slots = capacity + c.block if not rows else min(rows, capacity + c.block)
+        kv = 2 * c.layers * s["kv"][1] * slots * c.head_dim * 2
+        fixed = 64 * len(c.aux_ids) * c.hidden * 2 + 16 * c.block * (c.hidden + s["mlp"][1]) * 4
+        return kv + fixed
+
+    return Geometry(bytes_at, 0, 0)

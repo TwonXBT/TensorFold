@@ -72,7 +72,8 @@ def _drafter(path, w, **kw):
 def test_config_and_split(tmp_path):
     """The config read: tap points after layers 0 and 1, the causal sliding window, the vanilla Markov head."""
 
-    from tensorfold.families.glm_moe_dsa.cuda.dspark import DSparkConfig, draft_parts, memory, ring_rows
+    from tensorfold.families.glm_moe_dsa.cuda.dspark import (DSparkConfig, draft_parts, memory, resume_rows,
+                                                           ring_rows)
 
     c = DSparkConfig.read(_checkpoint(tmp_path))
     assert c.tap_layers == (0, 1)
@@ -82,7 +83,8 @@ def test_config_and_split(tmp_path):
     assert draft_parts(HEADS, HEADS, 512, 2) == ([2, 2], [2, 2], [256, 256])   # the MLP in units of 128
     assert draft_parts(HEADS, HEADS, 512, 4) == ([1, 1, 1, 1], [1, 1, 1, 1], [128, 128, 128, 128])
     assert draft_parts(64, 64, 12288, 4) == ([16] * 4, [16] * 4, [3072] * 4)   # the real checkpoint's split
-    assert ring_rows(c) == 192                       # the window, the block and a tile: ceil((63+8+63)/64)*64
+    # the window, the resume spare (TF_GLM_DSPARK_RESUME_ROWS), the block and a tile, in whole tiles of 64
+    assert ring_rows(c) == -(-(63 + resume_rows() + 8 + 63) // 64) * 64
     m = memory(c, 0, 1, capacity=256)
     assert m["host"] == 2 * V * RANK * 2             # the replicated Markov tables, bf16
 

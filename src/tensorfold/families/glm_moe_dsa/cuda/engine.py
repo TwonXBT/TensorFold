@@ -81,10 +81,21 @@ class GlmEngine:
         # each rank holds its vocabulary span of the embedding (weights.embed_span), not the whole table
         rows = PROMPT_ROWS if prefill_rows is None else int(prefill_rows)
         streams = max(1, int(parallel))
+        # a --drafter dir holding a DSpark speculator joins the capacity plan: its weights once, its K/V context
+        # and fixed buffers a slot (dspark.dspark_weights / dspark_geometry; anything else is refused below)
+        from .dspark import dspark_geometry, dspark_weights, is_dspark
+
+        self.dspark = drafter is not None and is_dspark(drafter)
+        if self.dspark and streams > 1:      # before admit: the plan would hold the drafter's bytes for nothing
+            raise ValueError("--drafter (DSpark) drafts for single-stream serving only: drop --parallel")
         self.capacity_plan = admit(model_dir, context if explicit else cfg.dense_limit, explicit, torch,
-                                   lambda text: self._geometry(text, world, dcp=G, rows=rows, streams=streams),
+                                   lambda text: self._geometry(text, world, dcp=G, rows=rows, streams=streams,
+                                                               taps=len(_tap_layers(drafter)) if self.dspark else 0),
                                    embed_transform(split_weights(rule, world), cfg.vocab, world, rank),
-                                   rank=rank, world=world, gather=self._gather_ints)
+                                   rank=rank, world=world, gather=self._gather_ints,
+                                   draft_dir=drafter if self.dspark else None,
+                                   draft_weights=lambda d: dspark_weights(d, world),
+                                   draft_geometry=lambda t: dspark_geometry(t, world, MAX_ROWS, ring=True))
         self.limit = self.capacity_plan["context_window"]
         capacity = self.capacity_plan["cache_slots"]
         long_context = self.limit > cfg.dense_limit
@@ -97,9 +108,12 @@ class GlmEngine:
         from .copy_drafts import CopySettings
 
         self.copy = None if serial_only else CopySettings.from_env(MAX_ROWS - 1)
-        mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(latent.ENABLED),
-                prefill_rows, int(embed_split()), kv8.mode_code(kv8.MODE), draft_vocab(), G, streams,
-                FILL_ROWS if streams > 1 else 0, QUICK_ROWS if streams > 1 else 0, int(DEPTH_COST * 1e6),
+        if drafter is not None and not self.dspark:
+            raise ValueError(f"{drafter}: --drafter wants a DSpark speculator (speculators_model_type=dspark); "
+                             "this family has no DFlash2 draft model")
+        mine = [int(drafter is not None), int(self.dspark), capacity, int(long_context), int(serial_only),
+                int(latent.ENABLED), prefill_rows, int(embed_split()), kv8.mode_code(kv8.MODE), draft_vocab(), G,
+                streams, FILL_ROWS if streams > 1 else 0, QUICK_ROWS if streams > 1 else 0, int(DEPTH_COST * 1e6),
                 int(KEEP), int(EXTENTS), int(DRAFT_CUT * 1e6), CUT_STREAMS] + \
             (self.copy.code() if self.copy is not None else [0] * len(CopySettings().code()))
         both = self._gather_ints(mine)
@@ -133,6 +147,7 @@ class GlmEngine:
         self.master = master
         self.concurrent = streams > 1
         self.multi = self.scheduler = None
+        self.drafter = None                     # a DSpark drafter (single-stream serving only, for now)
         if self.concurrent:
             from tensorfold.cuda.scheduler import Scheduler
 
@@ -156,10 +171,17 @@ class GlmEngine:
                 print(f"[tensorfold] up to {streams} requests decode together, each with a {self.limit}-token window "
                       f"({pool}); {depth} MTP drafts a round", flush=True)
         else:
-            # taps=(): no drafter yet; a DSpark drafter (later steps) passes its tap_layers, and the
-            # geometry below then counts the tap buffers (decode rows + the prompt chunks' rows)
+            # a DSpark drafter attaches through the tap buffers: its tap_layers become the Decoder's tap points
+            # (the geometry above counted them), and its own graphs capture after the engine's
+            if self.dspark:
+                from .dspark import Drafter
+
+                self.drafter = Drafter(drafter, w, capacity=capacity, tap_rows=MAX_ROWS, ring=True)
             self.e = Decoder(w, capacity=capacity, max_rows=MAX_ROWS, prefill_rows=prefill_rows, graphs=True,
-                             graph_rows=GRAPH_ROWS, long_context=long_context, taps=())
+                             graph_rows=GRAPH_ROWS, long_context=long_context,
+                             taps=self.drafter.tap_layers if self.drafter is not None else ())
+            if self.drafter is not None:
+                self.drafter.capture()
         self.eos = tuple(w.cfg.eos)
         self.model_dir = Path(model_dir)
         self.request = threading.local()    # the calling request's policy and stop-at-EOS (``app.GlmApp``)
@@ -315,7 +337,7 @@ class GlmEngine:
         from .decode import DEPTH_COST, AcceptPolicy, DepthPolicy, mtp_decode, prefill, serial_decode
 
         t0 = time.perf_counter()
-        first = prefill(self.e, prompt, sampling)
+        first = prefill(self.e, prompt, sampling, drafter=self.drafter)
         stats: dict[str, Any] = {"prefill_s": time.perf_counter() - t0, "cached": getattr(self.e, "cached", 0)}
         on_tokens([first])
         if max_tokens <= 1 or (stop_eos and first in self.eos):
@@ -337,6 +359,17 @@ class GlmEngine:
             print(f"[tensorfold] decode {len(res.tokens)} tok {res.tokens_per_second:.2f} tok/s rounds {res.rounds}"
                   f" drafted {res.drafted} accepted {res.accepted}{copy_note}", flush=True)
         return stats
+
+
+def _tap_layers(drafter: Path | None) -> tuple[int, ...]:
+    """A DSpark dir's tap points (``DSparkConfig.tap_layers``) without loading its weights, for the capacity
+    plan's tap-buffer count; () when no drafter was given."""
+
+    if drafter is None:
+        return ()
+    from .dspark import DSparkConfig, is_dspark
+
+    return DSparkConfig.read(drafter).tap_layers if is_dspark(drafter) else ()
 
 
 def _store(comm):
