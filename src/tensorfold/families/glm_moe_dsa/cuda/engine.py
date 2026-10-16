@@ -292,7 +292,12 @@ class GlmEngine:
                                          stop_eos=stop_eos)
         spec = getattr(self.request, "policy", None) or self.policy
         stop_eos = bool(getattr(self.request, "stop_eos", True))
-        code = [1 if spec not in ("", "0") else 0, min(int(spec) if str(spec).isdigit() else 3, MAX_ROWS - 1), 0, 0]
+        # "depth" or "depth:confidence" (tf_policy, or model@policy): a DSpark drafter takes both from an explicit
+        # request policy (code[3] = 1), else TF_GLM_DSPARK_DEPTH / _CONFIDENCE; code[2] = confidence * 1e4 + 1
+        head, _, conf = str(spec).partition(":")
+        explicit = int(getattr(self.request, "policy", None) is not None)
+        code = [1 if head not in ("", "0") else 0, min(int(head) if head.isdigit() else 3, MAX_ROWS - 1),
+                int(round(float(conf) * 1e4)) + 1 if conf else 0, explicit]
         seed = (sampling.seed if sampling else 0) & 0xFFFFFFFFFFFFFFFF
         header = [max_tokens, int(stop_eos), int(draft), 0, seed & 0x7FFFFFFF, (seed >> 31) & 0x7FFFFFFF,
                   seed >> 62, *_f64_ints(sampling.temperature if sampling else 0.0),
@@ -316,7 +321,7 @@ class GlmEngine:
             return
         while True:
             (max_tokens, stop_eos, draft, _cached, s_lo, s_hi, s_top, t_lo, t_hi, top_k, p_lo, p_hi, m_lo, m_hi,
-             shaped, kind, most, _a, _b) = self._share(None)
+             shaped, kind, most, conf_code, explicit) = self._share(None)
             prompt = self._share(None)
             constraint = None
             if shaped:
@@ -330,7 +335,7 @@ class GlmEngine:
             sampling = (Sampling(seed, temperature, top_k, _ints_f64(p_lo, p_hi), _ints_f64(m_lo, m_hi))
                         if temperature > 0 else None)
             self._run(prompt, max_tokens, sampling, bool(stop_eos), lambda new: None,
-                      [kind, most, 0, 0], bool(draft), constraint)
+                      [kind, most, conf_code, explicit], bool(draft), constraint)
 
     def _run(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool,
              on_tokens: Callable[[list[int]], Any], code: list[int], draft: bool, constraint=None) -> dict[str, Any]:
@@ -355,7 +360,9 @@ class GlmEngine:
             policy = AcceptPolicy(code[1]) if DEPTH_COST > 0 else DepthPolicy(code[1], fixed=True)
         dspark = self.drafter is not None and policy is not None and draft
         if dspark:                              # the DSpark drafter drafts instead of the MTP head (its own depth)
-            policy = DepthPolicy(DSPARK_DEPTH, fixed=True, confidence=DSPARK_CONFIDENCE)
+            depth = code[1] if code[3] else DSPARK_DEPTH
+            confidence = (code[2] - 1) / 1e4 if code[2] else DSPARK_CONFIDENCE
+            policy = DepthPolicy(depth, fixed=True, confidence=confidence)
         copies = None
         if policy is not None and (self.w.mtp is not None or dspark) and draft and self.copy is not None:
             copies = self.copy.drafts(list(prompt) + [first], hybrid=False)   # prompt and pending token, alike on every rank
@@ -372,8 +379,10 @@ class GlmEngine:
         if self.w.comm is None or self.w.rank == 0:
             copy_note = f" copy {res.copy_rounds}/{res.copy_accepted} kept" if getattr(res, "copy_rounds", 0) else ""
             print(f"[tensorfold] decode {len(res.tokens)} tok {res.tokens_per_second:.2f} tok/s rounds {res.rounds}"
-                  f" drafted {res.drafted} accepted {res.accepted}{copy_note}{' dspark' if dspark else ''}",
-                  flush=True)
+                  f" drafted {res.drafted} accepted {res.accepted}{copy_note}"
+                  + (f" dspark d{policy.most} c{policy.confidence:g} ms/round draft "
+                     f"{1e3 * res.stages['draft'] / max(1, res.rounds):.1f} fwd "
+                     f"{1e3 * res.stages['forward'] / max(1, res.rounds):.1f}" if dspark else ""), flush=True)
         return stats
 
 
